@@ -1,32 +1,31 @@
 # Nuke Bot
 
-## Railway variables (obligatoire)
+## Variables Railway (mets-en UNE pour le token)
+
+N'importe lequel de ces noms marche :
 
 ```
-TOKEN=coller_le_token_SANS_guillemets
-OWNER_IDS=ton_id_discord_numerique
+TOKEN
+DISCORD_TOKEN
+BOT_TOKEN
+DISCORD_BOT_TOKEN
 ```
 
-Aussi accepté : `DISCORD_TOKEN` et `OWNER_ID`.
-
-## Checklist Discord
-
-1. https://discord.com/developers/applications → ton app → Bot
-2. Reset Token → copier → coller dans Railway `TOKEN` **sans guillemets**
-3. Privileged Gateway Intents :
-   - SERVER MEMBERS INTENT = ON
-   - MESSAGE CONTENT INTENT = ON
-4. OAuth2 → URL Generator → scopes `bot` → permission Administrator → invite
-
-## Logs à chercher après redeploy
+Owners (un de ceux-là) :
 
 ```
-=== NUKE BOT BOOT ===
-TOKEN present=True length=70…
-Health OK on 0.0.0.0:…
-Connecting to Discord…
-===== BOT ONLINE as Name#0000 =====
+OWNER_IDS=123456789
+OWNER_ID=123456789
 ```
 
-Si `TOKEN present=False` → variable pas sur le bon service.
-Si `LOGIN FAILED` → token mort, régénère.
+Valeur **sans guillemets**, sans espace avant/après.
+
+Après redeploy, dans les logs cherche :
+
+```
+ENV KEYS (...): ...
+TOKEN found=True
+===== BOT ONLINE as ...
+```
+
+Si `TOKEN found=False`, regarde la ligne `ENV KEYS` : ton nom de variable n'y est pas → elle n'est pas injectée dans ce service.

