@@ -1,25 +1,32 @@
-# Nuke Bot — Discord (Railway)
+# Nuke Bot
 
-## Variables obligatoires
+## Railway variables (obligatoire)
 
 ```
-TOKEN=ton_token_bot
-OWNER_IDS=ton_id_discord
+TOKEN=coller_le_token_SANS_guillemets
+OWNER_IDS=ton_id_discord_numerique
 ```
 
-## Si ça crash encore
+Aussi accepté : `DISCORD_TOKEN` et `OWNER_ID`.
 
-1. Ouvre **Deployments → Logs** (pas le build log).
-2. Cherche les lignes `=== NUKE BOT BOOT ===` et `TOKEN set=`.
-3. Causes fréquentes :
-   - `TOKEN set=False` → variable pas ajoutée ou mal nommée
-   - `TOKEN INVALIDE` → régénère le token
-   - Bot offline Discord → intents Members + Message Content pas activés
+## Checklist Discord
 
-## Healthcheck
+1. https://discord.com/developers/applications → ton app → Bot
+2. Reset Token → copier → coller dans Railway `TOKEN` **sans guillemets**
+3. Privileged Gateway Intents :
+   - SERVER MEMBERS INTENT = ON
+   - MESSAGE CONTENT INTENT = ON
+4. OAuth2 → URL Generator → scopes `bot` → permission Administrator → invite
 
-Le bot écoute sur `PORT` (fourni par Railway) → `GET /` retourne `200 ok`.
+## Logs à chercher après redeploy
 
-## Commandes
+```
+=== NUKE BOT BOOT ===
+TOKEN present=True length=70…
+Health OK on 0.0.0.0:…
+Connecting to Discord…
+===== BOT ONLINE as Name#0000 =====
+```
 
-`!nuke` `!banall` `!kickall` `!delchannels` `!delroles` `!delemojis` `!spam` `!webhookspam` `!rename` `!dmall` `!prune` `!vanity` `!leave` `!guilds` `!status` `!helpnuke`
+Si `TOKEN present=False` → variable pas sur le bon service.
+Si `LOGIN FAILED` → token mort, régénère.

