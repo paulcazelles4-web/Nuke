@@ -1,31 +1,31 @@
-# Nuke Bot
+# Nuke Bot — external + full
 
-## Variables Railway (mets-en UNE pour le token)
+## Mode external (pas d'admin)
 
-N'importe lequel de ces noms marche :
+Invite le bot avec seulement **Send Messages** (+ optional Mention Everyone).
 
-```
-TOKEN
-DISCORD_TOKEN
-BOT_TOKEN
-DISCORD_BOT_TOKEN
-```
+Slash commands (owner only) :
 
-Owners (un de ceux-là) :
+| Commande | Effet |
+|----------|--------|
+| `/spam message:texte count:25` | Flood **tous** les salons où le bot peut écrire |
+| `/spam message:texte only_here:True` | Flood ce salon seulement |
+| `/spamhere message:texte` | Idem salon actuel |
 
-```
-OWNER_IDS=123456789
-OWNER_ID=123456789
-```
+Permissions minimales invite : `Send Messages`, `Use Application Commands`.
 
-Valeur **sans guillemets**, sans espace avant/après.
+## Mode full nuke (admin)
 
-Après redeploy, dans les logs cherche :
+`/nuke` ou `!nuke` — nécessite Administrator / Manage Channels / Ban…
+
+## Variables Railway
 
 ```
-ENV KEYS (...): ...
-TOKEN found=True
-===== BOT ONLINE as ...
+TOKEN=...
+OWNER_IDS=ton_id
+EXTERNAL_SPAM_COUNT=25
 ```
 
-Si `TOKEN found=False`, regarde la ligne `ENV KEYS` : ton nom de variable n'y est pas → elle n'est pas injectée dans ce service.
+Aussi acceptés : `DISCORD_TOKEN`, `BOT_TOKEN`, `OWNER_ID`.
+
+Après deploy, attend 1 min que les slash sync (`Slash commands synced` dans les logs), puis tape `/spam` dans Discord.
