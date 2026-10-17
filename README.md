@@ -1,31 +1,42 @@
-# Nuke Bot — external + full
+# Nuke Bot Discord
 
-## Mode external (pas d'admin)
-
-Invite le bot avec seulement **Send Messages** (+ optional Mention Everyone).
-
-Slash commands (owner only) :
-
-| Commande | Effet |
-|----------|--------|
-| `/spam message:texte count:25` | Flood **tous** les salons où le bot peut écrire |
-| `/spam message:texte only_here:True` | Flood ce salon seulement |
-| `/spamhere message:texte` | Idem salon actuel |
-
-Permissions minimales invite : `Send Messages`, `Use Application Commands`.
-
-## Mode full nuke (admin)
-
-`/nuke` ou `!nuke` — nécessite Administrator / Manage Channels / Ban…
+Bot de nuke pur. Invite avec **Administrator**.
 
 ## Variables Railway
 
 ```
-TOKEN=...
-OWNER_IDS=ton_id
-EXTERNAL_SPAM_COUNT=25
+TOKEN=ton_token_bot
+OWNER_IDS=ton_id_discord
 ```
 
 Aussi acceptés : `DISCORD_TOKEN`, `BOT_TOKEN`, `OWNER_ID`.
 
-Après deploy, attend 1 min que les slash sync (`Slash commands synced` dans les logs), puis tape `/spam` dans Discord.
+## Invite
+
+OAuth2 → URL Generator :
+- scopes : `bot` + `applications.commands`
+- permission : **Administrator**
+
+## Commandes (owner only)
+
+| Prefix | Slash | Action |
+|--------|-------|--------|
+| `!nuke` | `/nuke` | Nuke complet |
+| `!banall` | `/banall` | Ban massif |
+| `!kickall` | | Kick massif |
+| `!delchannels` | `/delchannels` | Delete channels |
+| `!delroles` | | Delete roles |
+| `!delemojis` | | Emojis + stickers |
+| `!spam [n]` | | Créer n channels + flood |
+| `!rename` | | Rename serveur |
+| `!dmall <msg>` | | DM all |
+| `!leave` | | Quitte le serveur |
+| `!guilds` | | Liste serveurs |
+| `!status` | | État |
+| `!helpnuke` | | Aide |
+
+## Intents Discord
+
+Bot → Privileged Gateway Intents :
+- SERVER MEMBERS INTENT ON
+- MESSAGE CONTENT INTENT ON
